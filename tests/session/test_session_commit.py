@@ -34,8 +34,100 @@ async def _marker_exists(session, archive_uri: str, name: str) -> bool:
         return False
 
 
+class _RecordingTimerHook:
+    def __init__(self) -> None:
+        self.snapshots = []
+        self.failures = []
+
+    async def report_after_append(self, snapshot) -> None:
+        self.snapshots.append(snapshot)
+
+    def record_report_failure(self, reason, exc=None) -> None:
+        self.failures.append((reason, exc))
+
+
 class TestCommit:
     """Test commit"""
+
+    async def test_append_reports_repaired_meta_after_authoritative_reload_failure(
+        self, session_with_messages: Session, monkeypatch
+    ):
+        hook = _RecordingTimerHook()
+        session_with_messages._timer_hook = hook
+        session_with_messages.meta.auto_commit_policy = {"idle_timeout_seconds": 60}
+        await session_with_messages._save_meta()
+        original_read_file = session_with_messages._viking_fs.read_file
+        meta_uri = f"{session_with_messages.uri}/.meta.json"
+        failed = False
+
+        async def fail_meta_reload_once(uri, *args, **kwargs):
+            nonlocal failed
+            if uri == meta_uri and not failed:
+                failed = True
+                raise RuntimeError("synthetic metadata reload failure")
+            return await original_read_file(uri, *args, **kwargs)
+
+        monkeypatch.setattr(session_with_messages._viking_fs, "read_file", fail_meta_reload_once)
+
+        await session_with_messages.add_message_async("user", [TextPart("latest activity")])
+
+        assert failed is True
+        assert len(hook.snapshots) == 1
+        assert hook.snapshots[0].last_message_at == session_with_messages.meta.last_message_at
+        assert hook.snapshots[0].auto_commit_policy == {"idle_timeout_seconds": 60}
+        assert hook.failures == []
+
+    async def test_service_timeout_archives_append_after_check_without_idle_phase1_extensions(
+        self, session_with_messages: Session, service, request_context, monkeypatch
+    ):
+        session = session_with_messages
+        session.meta.auto_commit_policy = {"idle_timeout_seconds": 60, "keep_recent_count": 2}
+        session.meta.keep_recent_count = 2
+        session.meta.last_message_at = "2000-01-01T00:00:00Z"
+        await session._save_meta()
+        original_commit = Session.commit_async
+        commits = []
+        extract = AsyncMock(
+            spec=session._session_compressor.extract_long_term_memories,
+            return_value=[],
+        )
+        monkeypatch.setattr(session._session_compressor, "extract_long_term_memories", extract)
+
+        async def append_before_commit(loaded_session, **kwargs):
+            commits.append(kwargs)
+            await loaded_session.add_message_async("user", [TextPart("append after idle check")])
+            return await original_commit(loaded_session, **kwargs)
+
+        monkeypatch.setattr(Session, "commit_async", append_before_commit)
+
+        result = await service.sessions.commit_on_timeout(session.session_id, request_context)
+
+        assert result["status"] == "accepted"
+        assert commits == [
+            {
+                "keep_recent_count": 0,
+                "persist_keep_recent_count": False,
+                "record_auto_commit_success": True,
+            }
+        ]
+        archived = await session._viking_fs.read_file(
+            f"{result['archive_uri']}/messages.jsonl", ctx=request_context
+        )
+        archived_messages = [json.loads(line) for line in archived.split("\n") if line.strip()]
+        assert len(archived_messages) == 5
+        assert archived_messages[-1]["parts"][0]["text"] == "append after idle check"
+        persisted = await service.sessions.get(session.session_id, request_context)
+        assert persisted.messages == []
+        assert persisted.meta.keep_recent_count == 2
+        assert persisted.meta.last_idle_commit_accepted_at
+        phase1 = await persisted._read_phase1_meta(result["archive_uri"])
+        assert phase1["status"] == "ready"
+        assert "idle_timeout" not in phase1
+        assert "last_idle_commit_accepted_at" not in phase1
+        assert "last_idle_commit_archive" not in persisted.meta.to_dict()
+        assert (await _wait_for_task(result["task_id"]))["status"] == "completed"
+        extract.assert_awaited_once()
+        assert len(extract.await_args.kwargs["messages"]) == 5
 
     async def test_commit_preserves_unicode_separators_and_accepts_later_messages(
         self, wm_session_with_messages: Session

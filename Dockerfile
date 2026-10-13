@@ -83,13 +83,13 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=uv-${TARGETPLATFORM} \
     fi; \
     case "${UV_LOCK_STRATEGY}" in \
         locked) \
-            uv sync --locked --no-editable --reinstall-package openviking --extra bot --extra gemini --extra opengauss --extra context-gateway \
+            uv sync --locked --no-editable --reinstall-package openviking --extra bot --extra gemini --extra opengauss --extra context-gateway --extra expiry \
             ;; \
         auto) \
             if ! uv lock --check; then \
                 uv lock; \
             fi; \
-            uv sync --locked --no-editable --reinstall-package openviking --extra bot --extra gemini --extra opengauss --extra context-gateway \
+            uv sync --locked --no-editable --reinstall-package openviking --extra bot --extra gemini --extra opengauss --extra context-gateway --extra expiry \
             ;; \
         *) \
             echo "Unsupported UV_LOCK_STRATEGY: ${UV_LOCK_STRATEGY}" >&2; \

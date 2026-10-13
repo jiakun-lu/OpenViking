@@ -3617,6 +3617,9 @@ ocr = [
 opengauss = [
     { name = "psycopg2-binary" },
 ]
+expiry = [
+    { name = "redis" },
+]
 test = [
     { name = "boto3" },
     { name = "datasets" },
@@ -3732,6 +3735,7 @@ requires-dist = [
     { name = "ragas", marker = "extra == 'test'", specifier = ">=0.1.0" },
     { name = "rapidfuzz", specifier = ">=3.14,<4" },
     { name = "readability-lxml", marker = "extra == 'bot'", specifier = ">=0.8.0" },
+    { name = "redis", marker = "extra == 'expiry'", specifier = ">=5,<6" },
     { name = "requests", specifier = ">=2.33.0" },
     { name = "rich", marker = "extra == 'bot'", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
@@ -3771,7 +3775,7 @@ requires-dist = [
     { name = "wheel", marker = "extra == 'build'" },
     { name = "xxhash", specifier = ">=3.0.0" },
 ]
-provides-extras = ["context-gateway", "context-gateway-fast", "test", "auth", "dev", "doc", "eval", "gemini", "gemini-async", "ocr", "build", "bot", "benchmark", "local-embed", "opengauss"]
+provides-extras = ["expiry", "context-gateway", "context-gateway-fast", "test", "auth", "dev", "doc", "eval", "gemini", "gemini-async", "ocr", "build", "bot", "benchmark", "local-embed", "opengauss"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0.2" }]
@@ -5438,6 +5442,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/55/3e/dc87d97532ddad58af786ec89c7036182e352574c1cba37bf2bf783d2b15/readability_lxml-0.8.4.1.tar.gz", hash = "sha256:9d2924f5942dd7f37fb4da353263b22a3e877ccf922d0e45e348e4177b035a53", size = 22874, upload-time = "2025-05-03T21:11:45.493Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/75/2cc58965097e351415af420be81c4665cf80da52a17ef43c01ffbe2caf91/readability_lxml-0.8.4.1-py3-none-any.whl", hash = "sha256:874c0cea22c3bf2b78c7f8df831bfaad3c0a89b7301d45a188db581652b4b465", size = 19912, upload-time = "2025-05-03T21:11:43.993Z" },
+]
+
+[[package]]
+name = "redis"
+version = "5.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "async-timeout", marker = "python_full_version < '3.11.3'" },
+    { name = "pyjwt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6a/cf/128b1b6d7086200c9f387bd4be9b2572a30b90745ef078bd8b235042dc9f/redis-5.3.1.tar.gz", hash = "sha256:ca49577a531ea64039b5a36db3d6cd1a0c7a60c34124d46924a45b956e8cf14c", size = 4626200, upload-time = "2025-07-25T08:06:27.778Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7f/26/5c5fa0e83c3621db835cfc1f1d789b37e7fa99ed54423b5f519beb931aa7/redis-5.3.1-py3-none-any.whl", hash = "sha256:dc1909bd24669cc31b5f67a039700b16ec30571096c5f1f0d9d2324bff31af97", size = 272833, upload-time = "2025-07-25T08:06:26.317Z" },
 ]
 
 [[package]]
