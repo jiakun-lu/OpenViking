@@ -7,7 +7,6 @@ Provides session management operations: session, sessions, add_message, commit, 
 """
 
 import asyncio
-import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -36,7 +35,7 @@ from openviking.session.memory_policy import MemoryPolicy
 from openviking.storage.viking_fs import VikingFS
 from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.utils.tags import normalize_search_tags
-from openviking.utils.time_utils import get_current_timestamp, parse_iso_datetime
+from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.exceptions import (
     AlreadyExistsError,
     NotFoundError,
@@ -47,7 +46,6 @@ from openviking_cli.utils.config.agent_evolution_config import AgentEvolutionCon
 from openviking_cli.utils.config.memory_config import SessionAutoCommitConfig
 
 logger = get_logger(__name__)
-_SESSION_META_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 def _parse_utc_timestamp(value: str) -> datetime:
@@ -493,11 +491,11 @@ class SessionService:
         return result
 
     async def commit_on_timeout(self, session_id: str, ctx: RequestContext) -> Dict[str, Any]:
-        """Validate once, then reuse the ordinary session commit API.
+        """Treat an idle-timeout callback as a signal to commit current messages.
 
-        Appends after validation are allowed: commit_async owns the snapshot
-        boundary and its existing lock/queue/recovery behavior. This wrapper
-        neither rechecks idle under that lock nor waits for memory extraction.
+        The callback does not recheck ``last_message_at``. Messages appended
+        after the timeout was scheduled are included in the commit snapshot;
+        later appends schedule their own timeout callback.
         """
         try:
             session = await self.get(session_id, ctx, auto_create=False)
@@ -512,16 +510,15 @@ class SessionService:
             keep_recent_count=0,
             persist_keep_recent_count=False,
             record_auto_commit_success=True,
+            record_idle_commit_success=True,
         )
-        if result.get("status") == "accepted":
-            await self._record_idle_commit_time(session_id, ctx, get_current_timestamp())
         self._record_lifecycle_metric("commit", "ok" if result.get("status") else "error")
         self._record_archive_metric("ok" if result.get("archived") else "skip")
         return result
 
     @staticmethod
     def _check_timeout_commit(session: Session, now: datetime) -> Optional[Dict[str, Any]]:
-        """Check the freshly loaded state without inspecting archive internals."""
+        """Check terminal skips and cooldown without rechecking idle activity."""
         policy_data = session.meta.auto_commit_policy
         if policy_data is None:
             return {"status": "skipped", "reason": "idle_disabled"}
@@ -543,70 +540,7 @@ class SessionService:
                     "timeout_seconds": timeout_seconds,
                     "due_at_ms": now_ms + timeout_seconds * 1000,
                 }
-        if not session.meta.last_message_at:
-            raise RuntimeError("Session last_message_at is missing")
-        last_message_at = _parse_utc_timestamp(session.meta.last_message_at)
-        activity_due_ms = int(last_message_at.timestamp() * 1000) + timeout_seconds * 1000
-        if now_ms < activity_due_ms:
-            return {
-                "status": "deferred",
-                "reason": "idle_activity",
-                "timeout_seconds": timeout_seconds,
-                "due_at_ms": activity_due_ms,
-            }
         return None
-
-    async def _record_idle_commit_time(
-        self, session_id: str, ctx: RequestContext, accepted_at: str
-    ) -> None:
-        """Best-effort patch of the latest metadata after an accepted commit.
-
-        Acquire the session lock only after commit_async returns. Re-read and
-        patch the raw dictionary rather than saving a stale Session.meta, so a
-        concurrent append/config change and unknown fields are preserved.
-        """
-        try:
-            self._ensure_initialized()
-            fs = self._viking_fs
-            session_uri = canonical_session_uri(ctx, session_id)
-            session_path = fs._uri_to_path(session_uri, ctx=ctx)
-            lease = await fs._async_agfs.pathlock_acquire_exact(
-                session_path, timeout_secs=_SESSION_META_LOCK_TIMEOUT_SECONDS
-            )
-            try:
-                # A missing meta (including a session deleted meanwhile) must
-                # not be replaced with stale data or recreate the session.
-                content = await fs.read_file(f"{session_uri}/.meta.json", ctx=ctx)
-                metadata = json.loads(content)
-                if not isinstance(metadata, dict):
-                    raise ValueError("Session metadata must be a JSON object")
-                previous = metadata.get("last_idle_commit_accepted_at")
-                if previous:
-                    try:
-                        previous_dt = _parse_utc_timestamp(previous)
-                    except (TypeError, ValueError):
-                        logger.warning("Replacing invalid idle commit time for %s", session_id)
-                    else:
-                        if previous_dt >= _parse_utc_timestamp(accepted_at):
-                            return
-                metadata["last_idle_commit_accepted_at"] = accepted_at
-                metadata["updated_at"] = get_current_timestamp()
-                # The held lease is an exact lock on the session directory, used
-                # to serialize against concurrent append/config meta rewrites.
-                # Writing the child .meta.json must take its own auto-pathlock
-                # (the directory lease does not cover a child-path write), just
-                # like Session._save_meta() does under the same directory lock.
-                await fs.write_file(
-                    f"{session_uri}/.meta.json",
-                    json.dumps(metadata, ensure_ascii=False),
-                    ctx=ctx,
-                )
-            finally:
-                await fs._async_agfs.pathlock_release(lease)
-        except Exception:
-            # Recording failure must not turn an already accepted commit into
-            # a retry. Cancellation still propagates (it is a BaseException).
-            logger.warning("Failed to record idle commit time for %s", session_id, exc_info=True)
 
     async def get_commit_task(self, task_id: str, ctx: RequestContext) -> Optional[Dict[str, Any]]:
         """Query background commit task status by task_id for the calling owner."""

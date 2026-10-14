@@ -17,7 +17,7 @@ from openviking.scheduling.expiry.models import (
     SourcePage,
     StoreOperationError,
 )
-from openviking.scheduling.expiry.publisher import ExpiryPublisher
+from openviking.scheduling.expiry.publisher import ExpiryPublisher, _wait_until_next_round
 from openviking.scheduling.expiry.shard_runner import ShardExecution
 
 
@@ -84,6 +84,11 @@ def config():
         cleanup_batch_size=8,
         registry_page_size=8,
     )
+
+
+@pytest.mark.asyncio
+async def test_round_wait_timeout_is_a_normal_scheduler_tick():
+    await _wait_until_next_round(asyncio.Event(), 0.001)
 
 
 @pytest.mark.asyncio

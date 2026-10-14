@@ -182,8 +182,16 @@ def config(**overrides):
     return ExpiryConfig.model_construct(**values)
 
 
-def consumer(store, handler, *, max_attempts=3, metadata_enabled=True, metrics=None):
-    timer_config = config()
+def consumer(
+    store,
+    handler,
+    *,
+    max_attempts=3,
+    metadata_enabled=True,
+    metrics=None,
+    timer_config=None,
+):
+    timer_config = timer_config or config()
     metrics = metrics or ExpiryMetrics()
     coordinator = ShardLeaseCoordinator(store, timer_config, metrics)
     shard_runner = ShardRunner(coordinator, timer_config, metrics)
@@ -414,6 +422,42 @@ async def test_timed_out_last_attempt_is_retried_without_becoming_exhausted():
     assert len(handler.requests) == 1
     assert len(store.released) == 1
     assert shard_runner.has_pending is False
+
+
+@pytest.mark.asyncio
+async def test_callback_timeout_is_handled_as_a_failed_attempt():
+    store = Store()
+    handler = Handler()
+    events = []
+    metrics = ExpiryMetrics(lambda name, value, labels: events.append((name, value, labels)))
+    resource_consumer, shard_runner = consumer(
+        store,
+        handler,
+        max_attempts=1,
+        metrics=metrics,
+        timer_config=config(processing_timeout_seconds=0.01),
+    )
+
+    assert (
+        await asyncio.wait_for(
+            shard_runner.run_if_acquired(
+                OwnerRole.CALLBACK,
+                0,
+                resource_consumer.process_shard,
+                asyncio.Event(),
+                item_type="session",
+            ),
+            timeout=2.0,
+        )
+        is True
+    )
+
+    assert handler.cancelled.is_set()
+    assert store.acked == [store.claims[0]]
+    assert any(
+        name == "timer_callback_exhausted" and labels["outcome"] == "callback_timeout"
+        for name, _, labels in events
+    )
 
 
 @pytest.mark.asyncio
@@ -687,6 +731,32 @@ async def test_consumer_worker_does_not_enter_runner_when_already_stopped():
     stop.set()
     await resource_consumer.run(stop)
     assert shard_runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_consumer_worker_continues_after_poll_timeout():
+    stop = asyncio.Event()
+
+    class PollingRunner:
+        def __init__(self):
+            self.calls = 0
+
+        async def run_if_acquired(self, role, shard_id, process, observed_stop, *, item_type=None):
+            self.calls += 1
+            if self.calls == 2:
+                observed_stop.set()
+            return False
+
+    runner = PollingRunner()
+    resource_consumer = worker_consumer(
+        Store(empty=True),
+        runner,
+        config(callback_poll_seconds=0.001),
+    )
+
+    await asyncio.wait_for(resource_consumer.run(stop), timeout=2.0)
+
+    assert runner.calls == 2
 
 
 @pytest.mark.asyncio

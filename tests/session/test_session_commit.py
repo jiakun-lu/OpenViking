@@ -8,6 +8,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from openviking.message import TextPart
 from openviking.server.identity import RequestContext
 from openviking.service.core import OpenVikingService
@@ -87,11 +89,7 @@ class TestCommit:
         await session._save_meta()
         original_commit = Session.commit_async
         commits = []
-        extract = AsyncMock(
-            spec=session._session_compressor.extract_long_term_memories,
-            return_value=[],
-        )
-        monkeypatch.setattr(session._session_compressor, "extract_long_term_memories", extract)
+        monkeypatch.setattr(Session, "resume_queued_commit", AsyncMock(return_value=True))
 
         async def append_before_commit(loaded_session, **kwargs):
             commits.append(kwargs)
@@ -108,6 +106,7 @@ class TestCommit:
                 "keep_recent_count": 0,
                 "persist_keep_recent_count": False,
                 "record_auto_commit_success": True,
+                "record_idle_commit_success": True,
             }
         ]
         archived = await session._viking_fs.read_file(
@@ -125,9 +124,106 @@ class TestCommit:
         assert "idle_timeout" not in phase1
         assert "last_idle_commit_accepted_at" not in phase1
         assert "last_idle_commit_archive" not in persisted.meta.to_dict()
-        assert (await _wait_for_task(result["task_id"]))["status"] == "completed"
-        extract.assert_awaited_once()
-        assert len(extract.await_args.kwargs["messages"]) == 5
+
+    async def test_idle_acceptance_is_persisted_after_phase1_ready(
+        self, session_with_messages: Session, monkeypatch
+    ):
+        session = session_with_messages
+        events = []
+        original_save_meta = session._save_meta
+        original_write_ready = session._write_phase1_ready_marker
+
+        async def record_save(*args, **kwargs):
+            events.append(("save", bool(session.meta.last_idle_commit_accepted_at)))
+            await original_save_meta(*args, **kwargs)
+
+        async def record_ready(*args, **kwargs):
+            await original_write_ready(*args, **kwargs)
+            events.append(("ready", bool(session.meta.last_idle_commit_accepted_at)))
+
+        monkeypatch.setattr(session, "_save_meta", record_save)
+        monkeypatch.setattr(session, "_write_phase1_ready_marker", record_ready)
+
+        result = await session.commit_async(record_idle_commit_success=True)
+
+        assert result["status"] == "accepted"
+        assert events == [("save", False), ("ready", False), ("save", True)]
+        persisted = json.loads(
+            await session._viking_fs.read_file(f"{session.uri}/.meta.json", ctx=session.ctx)
+        )
+        assert persisted["last_idle_commit_accepted_at"]
+        assert (await session._read_phase1_meta(result["archive_uri"]))["status"] == "ready"
+
+    async def test_idle_acceptance_write_failure_keeps_phase1_accepted(
+        self, session_with_messages: Session, monkeypatch
+    ):
+        session = session_with_messages
+        session.meta.last_idle_commit_accepted_at = "2026-01-01T00:00:00Z"
+        await session._save_meta()
+        events = []
+        save_count = 0
+        phase1_updated_at = ""
+        original_save_meta = session._save_meta
+        original_write_ready = session._write_phase1_ready_marker
+
+        async def fail_idle_save(*args, **kwargs):
+            nonlocal phase1_updated_at, save_count
+            save_count += 1
+            events.append("save")
+            if save_count == 2:
+                session.meta.updated_at = "failed-write-timestamp"
+                raise RuntimeError("idle acceptance metadata write failed")
+            await original_save_meta(*args, **kwargs)
+            phase1_updated_at = session.meta.updated_at
+
+        async def record_ready(*args, **kwargs):
+            await original_write_ready(*args, **kwargs)
+            events.append("ready")
+
+        monkeypatch.setattr(session, "_save_meta", fail_idle_save)
+        monkeypatch.setattr(session, "_write_phase1_ready_marker", record_ready)
+
+        result = await session.commit_async(record_idle_commit_success=True)
+
+        assert result["status"] == "accepted"
+        assert events == ["save", "ready", "save"]
+        assert session.meta.last_idle_commit_accepted_at == "2026-01-01T00:00:00Z"
+        assert session.meta.updated_at == phase1_updated_at
+        persisted = json.loads(
+            await session._viking_fs.read_file(f"{session.uri}/.meta.json", ctx=session.ctx)
+        )
+        assert persisted["last_idle_commit_accepted_at"] == "2026-01-01T00:00:00Z"
+        assert persisted["updated_at"] == phase1_updated_at
+        assert (await session._read_phase1_meta(result["archive_uri"]))["status"] == "ready"
+        assert not await _marker_exists(session, result["archive_uri"], ".failed.json")
+
+    async def test_idle_acceptance_is_not_recorded_when_ready_marker_fails(
+        self, session_with_messages: Session, monkeypatch
+    ):
+        session = session_with_messages
+        save_count = 0
+        original_save_meta = session._save_meta
+
+        async def record_save(*args, **kwargs):
+            nonlocal save_count
+            save_count += 1
+            await original_save_meta(*args, **kwargs)
+
+        async def fail_ready(*args, **kwargs):
+            raise RuntimeError("ready marker unavailable")
+
+        monkeypatch.setattr(session, "_save_meta", record_save)
+        monkeypatch.setattr(session, "_write_phase1_ready_marker", fail_ready)
+
+        with pytest.raises(RuntimeError, match="ready marker unavailable"):
+            await session.commit_async(record_idle_commit_success=True)
+
+        assert save_count == 1
+        assert session.meta.last_idle_commit_accepted_at == ""
+        persisted = json.loads(
+            await session._viking_fs.read_file(f"{session.uri}/.meta.json", ctx=session.ctx)
+        )
+        assert persisted["last_idle_commit_accepted_at"] == ""
 
     async def test_commit_preserves_unicode_separators_and_accepts_later_messages(
         self, wm_session_with_messages: Session

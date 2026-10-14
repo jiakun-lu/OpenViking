@@ -321,8 +321,8 @@ class SessionMeta:
     # Timestamp of the most recent successful auto-commit, surfaced via session
     # GET and used to throttle auto-commit frequency.
     last_auto_commit_at: str = ""
-    # Timeout commits record their accepted time externally; this is separate
-    # from the legacy auto-commit statistic and is not a Phase-1 ready marker.
+    # Timeout commits stamp their accepted time after the Phase 1 ready marker;
+    # this remains separate from the legacy auto-commit statistic.
     last_idle_commit_accepted_at: str = ""
     # Default custom scalar tags applied to event memories extracted from this
     # session. Maps to config.memory_extraction_config.events.tags in the API.
@@ -1316,6 +1316,7 @@ class Session:
         min_raw_tail_steps: Optional[int] = None,
         persist_keep_recent_count: bool = True,
         record_auto_commit_success: bool = False,
+        record_idle_commit_success: bool = False,
         event_tags: Optional[List[str]] = None,
         reset_context: bool = False,
     ) -> Dict[str, Any]:
@@ -1344,6 +1345,9 @@ class Session:
             record_auto_commit_success: When ``True``, clear the auto-commit
                 error fields and stamp ``last_auto_commit_at`` in the same
                 lock-protected meta update as the commit boundary.
+            record_idle_commit_success: When ``True``, best-effort stamp
+                ``last_idle_commit_accepted_at`` after the Phase 1 ready marker
+                is durable and before releasing the Session lock.
             event_tags: Per-commit override for the custom scalar tags applied
                 to event memories. ``None`` uses the session default
                 (``meta.event_search_tags``); an empty list disables default-tag
@@ -1682,6 +1686,20 @@ class Session:
                     self._meta.last_auto_commit_at = get_current_timestamp()
                 await self._save_meta()
                 await self._write_phase1_ready_marker(archive_uri)
+                if record_idle_commit_success:
+                    previous_accepted_at = self._meta.last_idle_commit_accepted_at
+                    previous_updated_at = self._meta.updated_at
+                    try:
+                        self._meta.last_idle_commit_accepted_at = get_current_timestamp()
+                        await self._save_meta()
+                    except Exception:
+                        self._meta.last_idle_commit_accepted_at = previous_accepted_at
+                        self._meta.updated_at = previous_updated_at
+                        logger.warning(
+                            "Failed to record idle commit time for %s",
+                            self.session_id,
+                            exc_info=True,
+                        )
             except Exception as e:
                 logger.error(f"[commit] Failed during {phase1_stage}: {e}")
                 # Whether the queue write failed or a queued Phase 1 stopped

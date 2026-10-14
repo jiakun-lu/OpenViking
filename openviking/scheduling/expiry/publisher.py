@@ -28,7 +28,7 @@ from .shard_runner import ShardExecution, ShardRunner
 async def _wait_until_next_round(stop: asyncio.Event, delay: float) -> None:
     try:
         await asyncio.wait_for(stop.wait(), delay)
-    except TimeoutError:
+    except asyncio.TimeoutError:
         pass
 
 

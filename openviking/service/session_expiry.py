@@ -126,7 +126,7 @@ class SessionTimeoutHandler:
         return self._to_callback_result(result)
 
     async def _report_deferred(self, identity: ItemIdentity, result: dict[str, Any]) -> None:
-        if result.get("reason") not in {"idle_cooldown", "idle_activity"}:
+        if result.get("reason") != "idle_cooldown":
             raise ValueError("Unexpected deferred session result")
         await self._scheduler.report(
             ExpiryRegistration(

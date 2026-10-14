@@ -109,7 +109,7 @@ class ExpiryConsumer:
             if not stop.is_set():
                 try:
                     await asyncio.wait_for(stop.wait(), self._config.callback_poll_seconds)
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     pass
 
     async def process_shard(self, lease: ShardExecution, stop: asyncio.Event) -> None:
@@ -292,7 +292,7 @@ class ExpiryConsumer:
                 )
             except asyncio.CancelledError:
                 raise
-            except TimeoutError as exc:
+            except asyncio.TimeoutError as exc:
                 self._record_callback_error(claim, exc)
                 lease.ensure_active()
                 await self._finish_failed_attempt(lease, claim, "callback_timeout")

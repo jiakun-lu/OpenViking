@@ -82,15 +82,14 @@ def test_disabled_policy_produces_no_report():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", ["idle_cooldown", "idle_activity"])
-async def test_handler_reports_deferred_before_completing_old_event(reason):
+async def test_handler_reports_cooldown_before_completing_old_event():
     scheduler = Scheduler()
 
     class Sessions:
         async def commit_on_timeout(self, session_id, ctx):
             return {
                 "status": "deferred",
-                "reason": reason,
+                "reason": "idle_cooldown",
                 "due_at_ms": 999,
                 "timeout_seconds": 30,
             }
@@ -114,13 +113,12 @@ async def test_handler_maps_not_found_to_completed():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", ["idle_cooldown", "idle_activity"])
-async def test_handler_deferred_report_failure_propagates(reason):
+async def test_handler_cooldown_report_failure_propagates():
     class Sessions:
         async def commit_on_timeout(self, session_id, ctx):
             return {
                 "status": "deferred",
-                "reason": reason,
+                "reason": "idle_cooldown",
                 "due_at_ms": 999,
                 "timeout_seconds": 30,
             }
