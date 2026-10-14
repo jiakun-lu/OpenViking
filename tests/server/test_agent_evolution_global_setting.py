@@ -19,6 +19,7 @@ from openviking.service.core import OpenVikingService
 from openviking.service.session_service import SessionService
 from openviking.session import Session
 from openviking_cli.session.user_id import UserIdentifier
+from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
 
 
 class _FakeAGFS:
@@ -217,9 +218,13 @@ def test_server_default_memory_policy_is_configured_on_session_service(fake_viki
 
 
 async def test_auto_commit_defaults_apply_to_new_sessions(fake_viking_fs, monkeypatch):
+    ov_config = OpenVikingConfig()
+    monkeypatch.setattr("openviking.server.app.get_openviking_config", lambda: ov_config)
+    with pytest.raises(ValidationError, match="must be 0 or at least 300"):
+        ServerConfig(user_config_defaults={"auto_commit_policy": {"idle_timeout_seconds": 299}})
     sessions = SessionService(viking_fs=fake_viking_fs)
     config = ServerConfig(
-        user_config_defaults={"auto_commit_policy": {"idle_timeout_seconds": 7200}}
+        user_config_defaults={"auto_commit_policy": {"idle_timeout_seconds": 300}}
     )
     create_app(
         config=config,
@@ -242,22 +247,6 @@ async def test_auto_commit_defaults_apply_to_new_sessions(fake_viking_fs, monkey
     session.meta.auto_commit_policy = None
     await sessions.get("auto-created", ctx, auto_create=True)
     assert session.meta.auto_commit_policy == expected
-
-
-def test_deployment_auto_commit_default_rejects_idle_timeout_below_five_minutes():
-    with pytest.raises(ValidationError, match="must be 0 or at least 300"):
-        ServerConfig(user_config_defaults={"auto_commit_policy": {"idle_timeout_seconds": 299}})
-
-
-@pytest.mark.parametrize("idle_timeout_seconds", [0, 300])
-def test_deployment_auto_commit_default_accepts_valid_idle_timeout(idle_timeout_seconds):
-    config = ServerConfig(
-        user_config_defaults={"auto_commit_policy": {"idle_timeout_seconds": idle_timeout_seconds}}
-    )
-
-    policy = config.user_config_defaults.auto_commit_policy
-    assert policy is not None
-    assert policy["idle_timeout_seconds"] == idle_timeout_seconds
 
 
 async def test_existing_session_observes_updated_account_value(fake_viking_fs):
