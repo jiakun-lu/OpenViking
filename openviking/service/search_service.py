@@ -27,18 +27,22 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def _ensure_non_empty_query(
+def _validate_query(
     query: str,
     image_url: Optional[str] = None,
     filter: Optional[Dict] = None,
 ) -> None:
-    """Reject a request that gives the search nothing to work with.
+    """Reject malformed query text or a request with nothing to search for.
 
     A filter is an acceptable substitute for a query: the result set is then
     fully determined by the filter, which is exactly what an exact-match lookup
     (e.g. by a tag carrying an external id) needs. Without either one the call
     would return an arbitrary slice of the whole store.
     """
+    try:
+        query.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise InvalidArgumentError("Search query must contain valid Unicode text.") from exc
     if query.strip() or image_url or filter:
         return
     raise InvalidArgumentError(
@@ -137,7 +141,7 @@ class SearchService:
         if search_type == "keywords" and image_url:
             raise InvalidArgumentError("image_url is not supported when search_type='keywords'")
         resolved_image_url = await self._resolve_image_url(image_url, ctx)
-        _ensure_non_empty_query(query, resolved_image_url)
+        _validate_query(query, resolved_image_url)
         if search_type == "keywords":
             await self.ensure_keywords_search_supported(ctx)
         viking_fs = self._ensure_initialized()
@@ -192,7 +196,7 @@ class SearchService:
         if search_type == "keywords" and image_url:
             raise InvalidArgumentError("image_url is not supported when search_type='keywords'")
         resolved_image_url = await self._resolve_image_url(image_url, ctx)
-        _ensure_non_empty_query(query, resolved_image_url, filter)
+        _validate_query(query, resolved_image_url, filter)
         viking_fs = self._ensure_initialized()
         result = await viking_fs.find(
             query=query,
@@ -225,7 +229,7 @@ class SearchService:
         from openviking.retrieve.skill_results import SkillResultResolver
         from openviking_cli.retrieve import ContextType, FindResult, TypedQuery
 
-        _ensure_non_empty_query(query)
+        _validate_query(query)
         fs = self._ensure_initialized()
         targets = resolve_retrieval_targets(target_uri, ctx).target_directories
         for target in targets:

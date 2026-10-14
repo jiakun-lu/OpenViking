@@ -181,6 +181,8 @@ curl -X POST http://localhost:1933/api/v1/search/find \
 
 Tags 必须使用严格的 `k=v` 字符串。传入多个 tags 时，`find()` 会要求全部命中；上面的例子只返回显式检索标签同时包含 `env=prod` 和 `team=search` 的上下文。
 
+完整索引记录写回或显式标签字段更新时，会丢弃存储中的遗留非法标签。读取只过滤非法标签，不修改存储。如需修复已知受影响的文件或目录，同时保留合法标签且不重新生成向量，可调用 `POST /api/v1/content/set_tags`，请求体为 `{"uri": "<affected-uri>", "tags": [], "mode": "append"}`。仅在需要同时修复目录后代时添加 `"recursive": true`。`default` 等裸值会被移除，不会通过猜测键名进行转换。
+
 **Python SDK**
 
 ```python
@@ -844,7 +846,7 @@ curl -X POST http://localhost:1933/api/v1/search/search \
 | case_insensitive | bool | 否 | False | 忽略大小写 |
 | node_limit | int | 否 | 256 | 最大返回节点数。省略时默认使用 256；如需更多结果，请显式传入更大的整数 |
 | exclude_uri | str | 否 | None | 要排除在搜索之外的 URI 前缀 |
-| level_limit | int | 否 | Python SDK: 5；HTTP API / CLI / Go SDK: 10 | 最大目录遍历深度。Go SDK 当前使用 HTTP API 默认值。 |
+| level_limit | int | 否 | 10 | 最大目录遍历深度。HTTP SDK 未指定时使用服务端默认值。 |
 | tags | string[] | 否 | 未设置 | 仅搜索同时匹配全部 `k=v` 检索标签的文件 |
 | include_tags | bool | 否 | `false` | 不过滤时也在每条命中中返回检索标签 |
 | before_context | int | 否 | 0 | 每条匹配行之前返回的上下文行数；仅 HTTP API 和 CLI 支持 |

@@ -47,7 +47,7 @@ def test_internal_publisher_loads_validated_expiry_config(tmp_path):
     "options",
     [
         {"enabled": False},
-        {"idle_backend": "legacy"},
+        {"idle_backend": "local"},
         {"separate": False},
     ],
 )

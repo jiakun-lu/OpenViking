@@ -582,11 +582,11 @@ class OpenVikingService:
         expiry_config = get_openviking_config().expiry
         session_expiry_enabled = (
             session_auto_commit_config.enabled
-            and getattr(session_auto_commit_config, "idle_backend", "legacy") == "redis"
+            and getattr(session_auto_commit_config, "idle_backend", "local") == "redis"
         )
         if (
             session_auto_commit_config.enabled
-            and getattr(session_auto_commit_config, "idle_backend", "legacy") == "legacy"
+            and getattr(session_auto_commit_config, "idle_backend", "local") == "local"
         ):
             self._session_auto_commit_scheduler = SessionAutoCommitScheduler(
                 self._session_service,

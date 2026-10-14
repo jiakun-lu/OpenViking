@@ -10,8 +10,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set
 
-from openviking.service.task_processing_time import pause_task_processing
-
 
 @dataclass
 class _RequestWaitState:
@@ -263,6 +261,17 @@ class RequestWaitTracker:
                 return True
             return not state.pending_semantic_roots and not state.pending_embedding_roots
 
+    def is_complete_except(self, telemetry_id: str, semantic_root_id: str) -> bool:
+        """Return whether all work except one coordinating semantic root has settled."""
+        if not telemetry_id:
+            return True
+        with self._lock:
+            state = self._states.get(telemetry_id)
+            if state is None:
+                return True
+            pending_semantic = state.pending_semantic_roots - {semantic_root_id}
+            return not pending_semantic and not state.pending_embedding_roots
+
     async def wait_for_request(
         self,
         telemetry_id: str,
@@ -271,14 +280,13 @@ class RequestWaitTracker:
     ) -> None:
         if not telemetry_id:
             return
-        with pause_task_processing():
-            start = time.time()
-            while True:
-                if self.is_complete(telemetry_id):
-                    return
-                if timeout is not None and (time.time() - start) > timeout:
-                    raise TimeoutError(f"Request processing not complete after {timeout}s")
-                await asyncio.sleep(poll_interval)
+        start = time.time()
+        while True:
+            if self.is_complete(telemetry_id):
+                return
+            if timeout is not None and (time.time() - start) > timeout:
+                raise TimeoutError(f"Request processing not complete after {timeout}s")
+            await asyncio.sleep(poll_interval)
 
     async def wait_for_embeddings(
         self,
@@ -290,18 +298,17 @@ class RequestWaitTracker:
         """Drain embeddings while the producing semantic root remains pending."""
         if not telemetry_id:
             return
-        with pause_task_processing():
-            while True:
-                with self._lock:
-                    state = self._states.get(telemetry_id)
-                    if state is None or not state.pending_embedding_roots:
-                        return
-                if stop_waiting is not None and stop_waiting():
-                    # Shutdown has drained the embedding consumer's active writes.
-                    # Leave this semantic delivery unacked for recovery rather than
-                    # waiting forever for embeddings still in the persistent queue.
-                    raise asyncio.CancelledError("Embedding worker stopped with queued work")
-                await asyncio.sleep(poll_interval)
+        while True:
+            with self._lock:
+                state = self._states.get(telemetry_id)
+                if state is None or not state.pending_embedding_roots:
+                    return
+            if stop_waiting is not None and stop_waiting():
+                # Shutdown has drained the embedding consumer's active writes.
+                # Leave this semantic delivery unacked for recovery rather than
+                # waiting forever for embeddings still in the persistent queue.
+                raise asyncio.CancelledError("Embedding worker stopped with queued work")
+            await asyncio.sleep(poll_interval)
 
     def build_queue_status(self, telemetry_id: str) -> Dict[str, Dict[str, object]]:
         with self._lock:

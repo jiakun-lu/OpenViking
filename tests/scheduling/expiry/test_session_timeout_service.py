@@ -582,7 +582,7 @@ async def test_record_idle_time_replaces_invalid_previous_acceptance(
 
 
 @pytest.fixture
-def enable_default_legacy_backend(monkeypatch):
+def enable_default_local_backend(monkeypatch):
     from openviking.service import core
 
     original_get_config = core.get_openviking_config
@@ -596,17 +596,17 @@ def enable_default_legacy_backend(monkeypatch):
 
 
 @pytest.fixture
-def legacy_service(enable_default_legacy_backend, service):
+def local_service(enable_default_local_backend, service):
     return service
 
 
 @pytest.mark.asyncio
-async def test_default_legacy_backend_starts_scheduler_without_expiry(legacy_service):
-    assert SessionAutoCommitConfig().idle_backend == "legacy"
-    assert legacy_service._session_auto_commit_scheduler is not None
-    assert legacy_service._session_auto_commit_scheduler._running is True
-    assert legacy_service._expiry_runtime is None
-    assert legacy_service.sessions._session_expiry_adapter is None
+async def test_default_local_backend_starts_scheduler_without_expiry(local_service):
+    assert SessionAutoCommitConfig().idle_backend == "local"
+    assert local_service._session_auto_commit_scheduler is not None
+    assert local_service._session_auto_commit_scheduler._running is True
+    assert local_service._expiry_runtime is None
+    assert local_service.sessions._session_expiry_adapter is None
 
 
 @pytest.fixture

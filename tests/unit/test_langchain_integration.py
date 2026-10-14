@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -365,14 +366,28 @@ def test_openviking_tool_schemas_describe_model_visible_arguments():
             )
 
 
-def test_openviking_health_tool_returns_safe_summary():
+@pytest.mark.parametrize(
+    ("status", "expected_state"),
+    [
+        ({"status": "degraded"}, "degraded"),
+        ({"is_healthy": True}, "healthy"),
+        ({"is_healthy": False}, "unhealthy"),
+        ({"healthy": False, "is_healthy": True}, "unhealthy"),
+        ({"ok": True, "is_healthy": False}, "healthy"),
+        ({"status": "degraded", "is_healthy": True}, "degraded"),
+        ({"state": "ready", "is_healthy": False}, "healthy"),
+        ({"is_healthy": "true"}, "unknown"),
+    ],
+)
+def test_openviking_health_tool_returns_safe_summary(status, expected_state):
     class StatusClient(InMemoryOpenVikingClient):
         def get_status(self) -> dict[str, Any]:
             return {
-                "status": "degraded",
+                **status,
                 "state_detail": "service is starting up and loading initial data from the persistence layer",
                 "hostname": "internal-openviking.local",
                 "database_url": "postgres://user:secret@example.internal/db",
+                "errors": ["postgres://user:secret@example.internal/db"],
                 "components": {"storage": {"status": "ok"}},
             }
 
@@ -380,10 +395,10 @@ def test_openviking_health_tool_returns_safe_summary():
     payload = json.loads(tools["viking_health"].invoke({}))
 
     assert payload["backend"] == "OpenViking"
-    assert payload["state"] == "degraded"
-    assert payload["healthy"] is False
+    assert payload["state"] == expected_state
+    assert payload["healthy"] is (expected_state == "healthy")
     assert payload["summary"] == {
-        "status": "degraded",
+        **status,
         "state_detail": "service is starting up and loading initial data from the pers...",
         "component_count": 1,
     }
@@ -1224,6 +1239,24 @@ def test_langgraph_store_round_trip_and_semantic_search():
     assert semantic[0].value["color"] == "azure"
 
     assert store.list_namespaces(prefix=("users",)) == [("users", "ada")]
+
+
+@pytest.mark.parametrize("use_batch", [False, True])
+def test_langgraph_store_accepts_mapping_values(use_batch):
+    store = OpenVikingStore(client=InMemoryOpenVikingClient())
+    original = {"color": "azure", "nested": {"rank": 3}}
+    value = MappingProxyType(original)
+
+    if use_batch:
+        store.batch([PutOp(namespace=("users", "ada"), key="preferences", value=value)])
+    else:
+        store.put(("users", "ada"), "preferences", value)
+
+    item = store.get(("users", "ada"), "preferences")
+    assert item.value == original
+    assert isinstance(item.value, dict)
+    assert store.search(("users",), query="azure")[0].value == original
+    assert original == {"color": "azure", "nested": {"rank": 3}}
 
 
 def test_langgraph_store_semantic_search_keeps_peer_id_out_of_retrieval():

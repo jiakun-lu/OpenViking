@@ -4,7 +4,18 @@ import pytest
 from pydantic import ValidationError
 
 from openviking.scheduling.expiry.config import ExpiryConfig, ExpiryRedisConfig
+from openviking_cli.utils.config.memory_config import SessionAutoCommitConfig
 from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
+
+
+@pytest.mark.parametrize("value", ["local", "redis"])
+def test_idle_backend_accepts_supported_values(value):
+    assert SessionAutoCommitConfig.model_validate({"idle_backend": value}).idle_backend == value
+
+
+def test_idle_backend_rejects_legacy_value():
+    with pytest.raises(ValidationError, match="idle_backend"):
+        SessionAutoCommitConfig.model_validate({"idle_backend": "legacy"})
 
 
 def test_publisher_uses_separate_process_by_default():

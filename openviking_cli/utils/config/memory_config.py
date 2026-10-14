@@ -21,10 +21,10 @@ class SessionAutoCommitConfig(BaseModel):
             "started. When disabled, neither happens."
         ),
     )
-    idle_backend: Literal["legacy", "redis"] = Field(
-        default="legacy",
+    idle_backend: Literal["local", "redis"] = Field(
+        default="local",
         description=(
-            "Idle timeout discovery backend. 'legacy' scans session metadata; "
+            "Idle timeout discovery backend. 'local' scans session metadata; "
             "'redis' uses distributed expiry scheduling."
         ),
     )

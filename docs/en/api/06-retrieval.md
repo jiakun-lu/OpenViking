@@ -181,6 +181,8 @@ curl -X POST http://localhost:1933/api/v1/search/find \
 
 Tags must use strict `k=v` strings. When multiple tags are provided, `find()` requires all of them; the example above only returns contexts whose explicit retrieval tags contain both `env=prod` and `team=search`.
 
+Legacy invalid stored tags are discarded when a full index record is written or an explicit tag field is updated. Reads filter invalid tags without changing storage. To repair a known affected file or directory without re-embedding or replacing its valid tags, call `POST /api/v1/content/set_tags` with `{"uri": "<affected-uri>", "tags": [], "mode": "append"}`. For directories, add `"recursive": true` only when descendants should also be repaired. Bare values such as `default` are removed, not assigned an inferred key.
+
 **Python SDK**
 
 ```python
@@ -845,7 +847,7 @@ The `grep()` method performs regex pattern matching search in the file system, u
 | case_insensitive | bool | No | False | Ignore case |
 | exclude_uri | str | No | None | URI prefix to exclude from search |
 | node_limit | int | No | 256 | Maximum number of results. Omitted requests default to 256; pass a larger integer when you need more results |
-| level_limit | int | No | Python SDK: 5; HTTP API / CLI / Go SDK: 10 | Maximum directory depth to traverse. The Go SDK currently uses the HTTP API default. |
+| level_limit | int | No | 10 | Maximum directory depth to traverse. HTTP SDKs use the server default when omitted. |
 | tags | string[] | No | Unset | Search only files matching every supplied `k=v` retrieval tag |
 | include_tags | bool | No | `false` | Include each matched file's retrieval tags without filtering |
 | before_context | int | No | 0 | Number of context lines returned before each match; supported by the HTTP API and CLI |
