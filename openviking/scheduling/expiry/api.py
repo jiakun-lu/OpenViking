@@ -65,6 +65,7 @@ class CallbackResult:
 class HandlerOptions:
     concurrency: int = 4
     max_attempts: int = 3
+    metadata_enabled: bool = True
 
 
 class ExpiryHandler(Protocol):

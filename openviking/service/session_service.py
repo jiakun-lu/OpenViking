@@ -60,7 +60,7 @@ def _parse_utc_timestamp(value: str) -> datetime:
 if TYPE_CHECKING:
     from openviking.config.vlm import VLMResolver
     from openviking.scheduling.expiry import ExpiryScheduler
-    from openviking.service.session_timer import SessionTimerAdapter
+    from openviking.service.session_expiry import SessionExpiryAdapter
     from openviking.session.compressor_v3 import SessionCompressorV3
     from openviking.usage_reporter import UsageReporter
 
@@ -92,15 +92,24 @@ class SessionService:
         self._auto_commit_inflight_lock = asyncio.Lock()
         # Strong refs so spawned tasks aren't GC'd mid-await.
         self._auto_commit_tasks: set[asyncio.Task] = set()
-        self._session_timer_adapter: Optional["SessionTimerAdapter"] = None
+        self._session_expiry_adapter: Optional["SessionExpiryAdapter"] = None
 
-    def configure_expiry(self, scheduler: "ExpiryScheduler", *, reporting_enabled: bool) -> None:
-        from openviking.service.session_timer import install_session_timer
+    def configure_expiry(
+        self,
+        scheduler: "ExpiryScheduler",
+        *,
+        consumer_concurrency: int = 8,
+    ) -> None:
+        from openviking.service.session_expiry import install_session_expiry
 
-        install_session_timer(scheduler, self, reporting_enabled=reporting_enabled)
+        install_session_expiry(
+            scheduler,
+            self,
+            concurrency=consumer_concurrency,
+        )
 
-    def set_session_timer_adapter(self, adapter: Optional["SessionTimerAdapter"]) -> None:
-        self._session_timer_adapter = adapter
+    def set_session_expiry_adapter(self, adapter: Optional["SessionExpiryAdapter"]) -> None:
+        self._session_expiry_adapter = adapter
 
     def set_dependencies(
         self,
@@ -240,7 +249,7 @@ class SessionService:
             memory_policy_provider=lambda: self._get_user_memory_policy(ctx),
             usage_reporter=self._usage_reporter,
             vlm_resolver=self._vlm_resolver,
-            timer_hook=self._session_timer_adapter,
+            expiry_reporter=self._session_expiry_adapter,
         )
 
     async def _get_user_memory_policy(self, ctx: RequestContext) -> Optional[Dict[str, Any]]:
@@ -385,10 +394,10 @@ class SessionService:
             raise NotFoundError(session_id, "session")
 
         await self._viking_fs.rm(session_uri, recursive=True, ctx=ctx)
-        if self._session_timer_adapter is not None:
+        if self._session_expiry_adapter is not None:
             from openviking.scheduling.expiry import SESSION_ITEM_TYPE, ItemIdentity
 
-            await self._session_timer_adapter.unregister_after_delete(
+            await self._session_expiry_adapter.unregister_after_delete(
                 ItemIdentity(SESSION_ITEM_TYPE, ctx.account_id, ctx.user.user_id, session_id)
             )
         logger.info(f"Deleted session: {session_id}")
@@ -582,11 +591,15 @@ class SessionService:
                             return
                 metadata["last_idle_commit_accepted_at"] = accepted_at
                 metadata["updated_at"] = get_current_timestamp()
+                # The held lease is an exact lock on the session directory, used
+                # to serialize against concurrent append/config meta rewrites.
+                # Writing the child .meta.json must take its own auto-pathlock
+                # (the directory lease does not cover a child-path write), just
+                # like Session._save_meta() does under the same directory lock.
                 await fs.write_file(
                     f"{session_uri}/.meta.json",
                     json.dumps(metadata, ensure_ascii=False),
                     ctx=ctx,
-                    lease_ref=lease,
                 )
             finally:
                 await fs._async_agfs.pathlock_release(lease)

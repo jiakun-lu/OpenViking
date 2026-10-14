@@ -48,19 +48,23 @@ def test_component_round_trip_preserves_unicode():
     assert decode_component(encode_component(value)) == value
 
 
-def test_timer_keys_only_use_a_control_hash_tag_where_required():
+def test_expiry_keys_only_use_a_control_hash_tag_where_required():
     keys = ExpiryKeys(encode_component("cluster/resource"))
     assert keys.service_key == encode_component("cluster/resource")
     ref = BucketRef("session", 7, 120_000)
+    tag = keys.control_tag(7)
+    assert keys.namespace() == f"expiry:namespace:{keys.service_key}"
+    assert keys.metadata("item") == f"expiry:metadata:{keys.service_key}:item"
+    assert keys.source(7) == f"expiry:publisher:source:{keys.service_key}:7"
+    assert keys.progress(7) == f"expiry:publisher:progress:{tag}"
+    assert keys.registry(7) == f"expiry:consumer:registry:{tag}"
+    assert keys.bucket(ref) == f"expiry:consumer:bucket:{keys.service_key}:session:7:120000"
     assert "{" not in keys.source(7)
     assert "{" not in keys.bucket(ref)
-    tag = keys.control_tag(7)
-    assert keys.progress(7) == f"resource_sche:process:consume_progress:{tag}"
-    assert keys.registry(7) == f"resource_consume:bucket_register:{tag}"
     scheduler_owner = keys.owner(OwnerRole.SCHEDULER, 7)
     callback_owner = keys.owner(OwnerRole.CALLBACK, 7, item_type="session")
-    assert scheduler_owner == f"resource_timer:owner:scheduler:{tag}"
-    assert callback_owner == f"resource_timer:owner:callback:session:{tag}"
+    assert scheduler_owner == f"expiry:publisher:owner:{tag}"
+    assert callback_owner == f"expiry:consumer:owner:session:{tag}"
 
 
 def test_callback_owner_requires_item_type_scope():

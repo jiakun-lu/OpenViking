@@ -580,12 +580,10 @@ class OpenVikingService:
             session_auto_commit_config = SessionAutoCommitConfig()
         self._session_service.set_session_auto_commit_config(session_auto_commit_config)
         expiry_config = get_openviking_config().expiry
-        expiry_enabled = expiry_config.enabled
         session_expiry_enabled = (
             session_auto_commit_config.enabled
             and getattr(session_auto_commit_config, "idle_backend", "legacy") == "redis"
         )
-        has_expiry_work = session_expiry_enabled
         if (
             session_auto_commit_config.enabled
             and getattr(session_auto_commit_config, "idle_backend", "legacy") == "legacy"
@@ -661,16 +659,22 @@ class OpenVikingService:
             self._queue_manager.start()
             logger.info("QueueManager workers started")
 
-        if expiry_enabled and has_expiry_work:
-            from openviking.scheduling.expiry.runtime import ExpiryRuntime
+        if session_expiry_enabled:
+            from openviking.scheduling.expiry.runtime import ExpiryRuntime, ExpiryRuntimeRoles
 
-            self._expiry_runtime = ExpiryRuntime(expiry_config)
+            self._expiry_runtime = ExpiryRuntime(
+                expiry_config,
+                roles=ExpiryRuntimeRoles(
+                    report=True,
+                    publish=not expiry_config.publisher_separate_process,
+                    consume=True,
+                ),
+            )
             try:
-                if session_expiry_enabled:
-                    self._session_service.configure_expiry(
-                        self._expiry_runtime.timer,
-                        reporting_enabled=expiry_config.reporting_enabled,
-                    )
+                self._session_service.configure_expiry(
+                    self._expiry_runtime.scheduler,
+                    consumer_concurrency=expiry_config.session_consumer_concurrency,
+                )
                 await self._expiry_runtime.start_storage()
                 await self._expiry_runtime.start_roles()
             except Exception:
@@ -707,7 +711,7 @@ class OpenVikingService:
         """Stop expiry work before releasing dependencies used by callbacks."""
         runtime = self._expiry_runtime
         if runtime is None:
-            self._session_service.set_session_timer_adapter(None)
+            self._session_service.set_session_expiry_adapter(None)
             return
         try:
             await runtime.close()
@@ -718,7 +722,7 @@ class OpenVikingService:
                 # callbacks. The caller can retry close after they terminate.
                 raise
         else:
-            self._session_service.set_session_timer_adapter(None)
+            self._session_service.set_session_expiry_adapter(None)
             self._expiry_runtime = None
             logger.info("Expiry stopped")
 

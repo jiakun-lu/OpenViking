@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 import time
 from importlib import resources
 from typing import Any, Literal, Sequence, cast
@@ -144,9 +143,20 @@ class RedisExpiryStore:
         )
         return ExpiryRegistrationResult(int(raw))
 
-    async def unregister_resource(self, shard_id: int, item_id: str) -> None:
+    async def unregister_resource(
+        self,
+        shard_id: int,
+        item_id: str,
+        *,
+        delete_metadata: bool = True,
+    ) -> None:
         await self._command("zrem", self._keys.source(shard_id), item_id, retry="idempotent")
-        await self._command("delete", self._keys.metadata(item_id), retry="idempotent")
+        if delete_metadata:
+            await self._single_key_command(
+                "DEL",
+                self._keys.metadata(item_id),
+                retry="idempotent",
+            )
 
     async def read_progress(self, shard_id: int) -> int:
         raw = await self._command("get", self._keys.progress(shard_id))
@@ -204,11 +214,10 @@ class RedisExpiryStore:
             self._keys.bucket(BucketRef(item_type, owner.shard_id, minute_ms))
             for item_type in item_types
         ]
-        # Bucket keys deliberately have no shared cluster hash tag. Delete
-        # them one at a time so Redis Cluster never rejects this reset with a
-        # CROSSSLOT error.
+        # Bucket keys deliberately have no shared cluster hash tag. Delete them
+        # one at a time, bypassing redis-py's cross-slot pipeline helper.
         for key in keys:
-            await self._command("unlink", key, retry="idempotent")
+            await self._single_key_command("UNLINK", key, retry="idempotent")
 
     async def stage_items(
         self, owner: OwnerToken, bucket: BucketRef, item_ids: Sequence[str]
@@ -598,11 +607,9 @@ class RedisExpiryStore:
         endpoint = self._config.endpoints[0]
         if "://" not in endpoint:
             endpoint = ("rediss" if self._config.tls else "redis") + "://" + endpoint
-        password = self._config.password
-        if password is None and self._config.password_env:
-            password = os.environ.get(self._config.password_env)
-        kwargs = {
-            "username": self._config.username,
+        password = self._config.resolve_password()
+        kwargs: dict[str, Any] = {
+            "username": self._config.username or None,
             "password": password,
             "decode_responses": True,
             "socket_connect_timeout": self._config.connect_timeout_seconds,
@@ -625,7 +632,16 @@ class RedisExpiryStore:
                 parsed = urlsplit(normalized)
                 use_tls = parsed.scheme == "rediss"
                 nodes.append(ClusterNode(parsed.hostname or "", parsed.port or 6379))
-            self._client = RedisCluster(startup_nodes=nodes, ssl=use_tls, **kwargs)
+            # Store retry policies must be the only authority for replaying
+            # commands: a lost CAS/SET NX response cannot safely be replayed.
+            # These instance-local flags leave MOVED/ASK routing intact.
+            self._client = RedisCluster(
+                startup_nodes=nodes,
+                ssl=use_tls,
+                cluster_error_retry_attempts=0,
+                connection_error_retry_attempts=0,
+                **kwargs,
+            )
         try:
             await self._client.ping()
         except Exception as exc:
@@ -633,13 +649,16 @@ class RedisExpiryStore:
             raise self._translate_redis_error(exc, retry="read") from exc
 
     async def _close_on_loop(self) -> None:
-        client, self._client = self._client, None
+        client = self._client
         if client is not None:
             close = getattr(client, "aclose", None) or getattr(client, "close", None)
             if close is not None:
                 result = close()
                 if result is not None:
                     await result
+            # Cancellation/failure is not proof of a closed client. Keep the
+            # reference until cleanup succeeds so partial startup can retry.
+            self._client = None
 
     async def _command(
         self, name: str, *args: object, retry: RetryPolicy = "read", **kwargs: Any
@@ -653,6 +672,17 @@ class RedisExpiryStore:
             )
 
         return await self._io.run(operation)
+
+    async def _single_key_command(
+        self,
+        command: str,
+        key: str,
+        *,
+        retry: RetryPolicy,
+    ) -> Any:
+        # redis-py 5.3.1 routes DEL/UNLINK helpers through ClusterPipeline,
+        # which skips execution when cluster_error_retry_attempts is zero.
+        return await self._command("execute_command", command, key, retry=retry)
 
     async def _eval(
         self,

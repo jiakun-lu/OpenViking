@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,18 @@ from .service import ExpiryRuntimeState, _ExpirySchedulerFacade
 from .shard_runner import ShardRunner
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ExpiryRuntimeRoles:
+    report: bool = False
+    publish: bool = False
+    consume: bool = False
+
+    def __post_init__(self) -> None:
+        if self.consume and not self.report:
+            raise ValueError("Expiry consumer requires reporting for deferred callbacks")
 
 
 @dataclass(eq=False)
@@ -63,7 +76,8 @@ class RedisLoopExecutor:
         ready = await asyncio.to_thread(self._ready.wait, 5.0)
         if not ready or self._loop is None:
             raise RuntimeError("Expiry Redis loop failed to start")
-        self._accepting = True
+        with self._requests_lock:
+            self._accepting = True
 
     async def run(self, operation: Callable[[], Awaitable[T]]) -> T:
         loop = self._loop
@@ -71,8 +85,6 @@ class RedisLoopExecutor:
         # their tracked parent request, and must be allowed after quiescing.
         if loop is not None and asyncio.get_running_loop() is loop:
             return await self._execute(operation)
-        if not self._accepting or loop is None:
-            raise StoreOperationError("not_started", "Redis expiry I/O loop is not running")
         request = self._submit(operation)
         finished = asyncio.wrap_future(request.finished)
         try:
@@ -86,8 +98,8 @@ class RedisLoopExecutor:
 
     async def quiesce(self, timeout_seconds: float) -> None:
         """Reject new work and observe actual remote termination before closing Redis."""
-        self._accepting = False
         with self._requests_lock:
+            self._accepting = False
             requests = list(self._requests)
         if requests:
             futures = {asyncio.wrap_future(request.finished) for request in requests}
@@ -121,6 +133,11 @@ class RedisLoopExecutor:
         deadline = time.monotonic() + max(0.0, timeout_seconds)
         await self.quiesce(timeout_seconds)
         loop, thread = self._loop, self._thread
+        if loop is None and thread is not None and thread.is_alive():
+            # start() may have been cancelled before the new thread published
+            # its loop. Wait only within the close budget, then stop that loop.
+            await asyncio.to_thread(self._ready.wait, max(0.0, deadline - time.monotonic()))
+            loop = self._loop
         if loop is not None and not self._stop_requested:
             self._stop_requested = True
             loop.call_soon_threadsafe(loop.stop)
@@ -137,31 +154,30 @@ class RedisLoopExecutor:
     def _submit(
         self, operation: Callable[[], Awaitable[T]], *, cleanup: bool = False
     ) -> _RedisRequest:
-        loop = self._loop
-        if loop is None or self._stop_requested:
-            raise StoreOperationError("not_started", "Redis expiry I/O loop is not running")
-        request = _RedisRequest()
-        # Register before scheduling: shutdown must also see not-yet-started I/O.
         with self._requests_lock:
+            loop = self._loop
+            if (not cleanup and not self._accepting) or loop is None or self._stop_requested:
+                raise StoreOperationError("not_started", "Redis expiry I/O loop is not running")
+            request = _RedisRequest()
+            # Register before scheduling: shutdown must also see not-yet-started I/O.
             self._requests.add(request)
 
-        async def cleanup_operation() -> T:
-            return await operation()
+            async def cleanup_operation() -> T:
+                return await operation()
 
-        def start_request() -> None:
-            request.task = asyncio.create_task(
-                cleanup_operation() if cleanup else self._execute(operation)
-            )
-            request.task.add_done_callback(lambda task: self._request_done(request, task))
-            if request.cancelled.is_set():
-                request.task.cancel()
+            def start_request() -> None:
+                request.task = asyncio.create_task(
+                    cleanup_operation() if cleanup else self._execute(operation)
+                )
+                request.task.add_done_callback(lambda task: self._request_done(request, task))
+                if request.cancelled.is_set():
+                    request.task.cancel()
 
-        try:
-            loop.call_soon_threadsafe(start_request)
-        except BaseException:
-            with self._requests_lock:
+            try:
+                loop.call_soon_threadsafe(start_request)
+            except BaseException:
                 self._requests.discard(request)
-            raise
+                raise
         return request
 
     def _cancel(self, request: _RedisRequest) -> None:
@@ -262,9 +278,11 @@ class ExpiryRuntime:
         self,
         config: ExpiryConfig,
         *,
+        roles: ExpiryRuntimeRoles,
         metrics: ExpiryMetrics | None = None,
     ) -> None:
         self._config = config
+        self._roles = roles
         self._metrics = metrics or ExpiryMetrics()
         self._keys = ExpiryKeys(encode_component(config.service_name))
         self._io = RedisLoopExecutor(
@@ -279,45 +297,84 @@ class ExpiryRuntime:
             self._registry,
             self._state,
             shard_count=config.shard_count,
-            reporting_enabled=config.reporting_enabled,
+            reporting_enabled=roles.report,
             metrics=self._metrics,
         )
         self._leases = ShardLeaseCoordinator(self._store, config, self._metrics)
         self._shard_runner = ShardRunner(self._leases, config, self._metrics)
-        self._scheduler: ExpiryPublisher | None = None
+        self._publisher: ExpiryPublisher | None = None
         self._consumers: dict[str, ExpiryConsumer] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop = asyncio.Event()
         self._storage_started = False
         self._storage_closed = False
+        # Readiness is not ownership: cancellation can leave resources behind
+        # before start_storage has completed.
+        self._storage_owned = False
+        self._store_open_attempted = False
+        self._storage_start_task: asyncio.Task[None] | None = None
 
     @property
-    def timer(self) -> ExpiryScheduler:
+    def scheduler(self) -> ExpiryScheduler:
         return self._facade
 
     async def start_storage(self) -> None:
         if self._storage_started:
             return
-        await self._io.start()
-        try:
-            await self._store.open()
-            await self._store.ensure_namespace(
-                NamespaceSpec(
-                    self._config.shard_count,
-                    HASH_NAME,
-                    HASH_SEED,
-                    IDENTITY_ENCODING,
-                )
+        if self._storage_owned or self._storage_start_task is not None:
+            raise StoreOperationError(
+                "shard_not_stopped", "Previous expiry storage startup has not been cleaned up"
             )
-        except Exception:
-            try:
-                await self._store.close()
-            finally:
-                await self._io.close(self._config.shutdown_timeout_seconds)
-            raise
-        self._storage_started = True
+        self._storage_owned = True
         self._storage_closed = False
+        # Keep the actual startup operation visible if it resists cancellation.
+        # The caller's cancellation must not make close assume it has stopped.
+        startup = asyncio.create_task(self._initialize_storage())
+        startup.add_done_callback(RedisLoopExecutor._consume_exception)
+        self._storage_start_task = startup
+        try:
+            await asyncio.shield(startup)
+        except BaseException:
+            if not startup.done():
+                startup.cancel()
+            try:
+                await self.close()
+            except BaseException:
+                # Preserve the original failure/cancellation. Ownership and the
+                # startup task remain available for a later close retry.
+                logger.warning("Expiry partial startup cleanup did not complete", exc_info=True)
+            raise
+        self._storage_start_task = None
+        self._storage_started = True
         self._state.storage_ready = True
+
+    async def _initialize_storage(self) -> None:
+        await self._io.start()
+        self._store_open_attempted = True
+        await self._store.open()
+        await self._store.ensure_namespace(
+            NamespaceSpec(
+                self._config.shard_count,
+                HASH_NAME,
+                HASH_SEED,
+                IDENTITY_ENCODING,
+            )
+        )
+
+    async def _settle_storage_start(self) -> None:
+        startup = self._storage_start_task
+        if startup is None:
+            return
+        if not startup.done():
+            startup.cancel()
+            done, _ = await asyncio.wait({startup}, timeout=self._config.shutdown_timeout_seconds)
+            if startup not in done:
+                raise StoreOperationError(
+                    "shard_not_stopped", "Expiry storage startup is still running"
+                )
+        if not startup.cancelled():
+            startup.exception()
+        self._storage_start_task = None
 
     async def start_roles(self) -> None:
         if not self._storage_started:
@@ -326,12 +383,12 @@ class ExpiryRuntime:
             return
         bindings = self._registry.freeze()
         self._stop.clear()
-        if self._config.scheduler_enabled:
-            self._scheduler = ExpiryPublisher(
+        if self._roles.publish:
+            self._publisher = ExpiryPublisher(
                 self._store, self._shard_runner, self._config, self._metrics
             )
-            self._spawn_role("scheduler", self._scheduler.run(self._stop))
-        if self._config.callback_enabled:
+            self._spawn_role("publisher", self._publisher.run(self._stop))
+        if self._roles.consume:
             for item_type, binding in bindings.items():
                 consumer = ExpiryConsumer(
                     self._store,
@@ -379,19 +436,23 @@ class ExpiryRuntime:
 
     async def close(self) -> None:
         await self.stop_roles()
-        if not self._storage_started:
+        if not self._storage_owned:
             return
+        await self._settle_storage_start()
         # Stop admission and check real Redis-loop tasks, not just their
         # application-loop wrappers, before closing any dependency.
         await self._io.quiesce(self._config.shutdown_timeout_seconds)
-        try:
-            if not self._storage_closed:
+        if not self._storage_closed:
+            if self._store_open_attempted:
                 await self._io.run_cleanup(self._store.close, self._config.shutdown_timeout_seconds)
-                self._storage_closed = True
-        finally:
-            await self._io.close(self._config.shutdown_timeout_seconds)
-            self._storage_started = False
-            self._state.storage_ready = False
+            self._storage_closed = True
+        # Keep ownership if client cleanup or thread termination failed. Once
+        # client cleanup succeeds, retries only observe the I/O thread join.
+        await self._io.close(self._config.shutdown_timeout_seconds)
+        self._storage_owned = False
+        self._store_open_attempted = False
+        self._storage_started = False
+        self._state.storage_ready = False
 
     def _spawn_role(self, name: str, operation: Coroutine[Any, Any, None]) -> None:
         task: asyncio.Task[None] = asyncio.create_task(operation, name=f"expiry-{name}")

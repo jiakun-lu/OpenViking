@@ -34,8 +34,8 @@ class Store:
         if self.fail_metadata:
             raise StoreOperationError("redis_error", "metadata failed", retryable=True)
 
-    async def unregister_resource(self, shard_id, item_id):
-        self.calls.append("unregister")
+    async def unregister_resource(self, shard_id, item_id, *, delete_metadata=True):
+        self.calls.append(("unregister", delete_metadata))
 
 
 def test_registry_validation_and_freeze():
@@ -75,6 +75,28 @@ async def test_report_writes_resource_before_metadata():
 
 
 @pytest.mark.asyncio
+async def test_report_skips_metadata_when_handler_disables_it():
+    store = Store()
+    registry = HandlerRegistry()
+    registry.register("session", Handler(), HandlerOptions(metadata_enabled=False))
+    facade = _ExpirySchedulerFacade(
+        store,
+        registry,
+        ExpiryRuntimeState(storage_ready=True, accepting_calls=True),
+        shard_count=8,
+        reporting_enabled=True,
+        metrics=ExpiryMetrics(),
+    )
+
+    result = await facade.report(
+        ExpiryRegistration(ItemIdentity("session", "a", "u", "s"), 1234, 60)
+    )
+
+    assert result.accepted_due_at_ms == 1234
+    assert store.calls == ["resource"]
+
+
+@pytest.mark.asyncio
 async def test_metadata_failure_does_not_roll_back_resource():
     store = Store()
     store.fail_metadata = True
@@ -87,9 +109,7 @@ async def test_metadata_failure_does_not_roll_back_resource():
         metrics=ExpiryMetrics(),
     )
     with pytest.raises(ExpiryError) as exc:
-        await facade.report(
-            ExpiryRegistration(ItemIdentity("session", "a", "u", "s"), 1234, 60)
-        )
+        await facade.report(ExpiryRegistration(ItemIdentity("session", "a", "u", "s"), 1234, 60))
     assert exc.value.code == "timer_unavailable"
     assert store.calls == ["resource", "metadata"]
 
@@ -128,3 +148,30 @@ async def test_unregister_rejects_unsupported_type_before_store_write():
         await facade.unregister(ItemIdentity("watch", "a", "u", "s"))
     assert exc.value.code == "unregistered_type"
     assert store.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata_enabled", "delete_metadata"),
+    [(True, True), (False, False)],
+)
+async def test_unregister_follows_handler_metadata_option(metadata_enabled, delete_metadata):
+    store = Store()
+    registry = HandlerRegistry()
+    registry.register(
+        "session",
+        Handler(),
+        HandlerOptions(metadata_enabled=metadata_enabled),
+    )
+    facade = _ExpirySchedulerFacade(
+        store,
+        registry,
+        ExpiryRuntimeState(storage_ready=True, accepting_calls=True),
+        shard_count=8,
+        reporting_enabled=True,
+        metrics=ExpiryMetrics(),
+    )
+
+    await facade.unregister(ItemIdentity("session", "a", "u", "s"))
+
+    assert store.calls == [("unregister", delete_metadata)]

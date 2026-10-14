@@ -39,9 +39,14 @@ class HandlerRegistry:
             raise ExpiryError("invalid_handler", "Handler concurrency must be positive")
         if type(options.max_attempts) is not int or not 1 <= options.max_attempts <= 256:
             raise ExpiryError("invalid_handler", "Handler max_attempts must be in [1, 256]")
+        if type(options.metadata_enabled) is not bool:
+            raise ExpiryError("invalid_handler", "Handler metadata_enabled must be a boolean")
         if item_type in self._bindings:
             raise ExpiryError("duplicate_handler", f"Handler already registered: {item_type}")
         self._bindings[item_type] = HandlerBinding(handler, options)
+
+    def get(self, item_type: str) -> HandlerBinding | None:
+        return self._bindings.get(item_type)
 
     def freeze(self) -> Mapping[str, HandlerBinding]:
         self._frozen = True

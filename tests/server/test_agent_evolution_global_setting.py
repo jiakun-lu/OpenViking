@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 
 from openviking.pyagfs import AGFSNotFoundError
 from openviking.server.app import create_app
@@ -200,9 +201,7 @@ async def test_server_agent_evolution_updates_initialized_runtime_baseline():
         OpenVikingConfigSingleton.reset_instance()
 
 
-def test_server_default_memory_policy_is_configured_on_session_service(
-    fake_viking_fs, monkeypatch
-):
+def test_server_default_memory_policy_is_configured_on_session_service(fake_viking_fs, monkeypatch):
     monkeypatch.setattr(
         "openviking.service.session_service.get_default_registry",
         lambda: SimpleNamespace(list_names=lambda **_: ["profile"]),
@@ -248,6 +247,22 @@ async def test_auto_commit_defaults_apply_to_new_sessions(fake_viking_fs, monkey
     session.meta.auto_commit_policy = None
     await sessions.get("auto-created", ctx, auto_create=True)
     assert session.meta.auto_commit_policy == expected
+
+
+def test_deployment_auto_commit_default_rejects_idle_timeout_below_five_minutes():
+    with pytest.raises(ValidationError, match="must be 0 or at least 300"):
+        ServerConfig(user_config_defaults={"auto_commit_policy": {"idle_timeout_seconds": 299}})
+
+
+@pytest.mark.parametrize("idle_timeout_seconds", [0, 300])
+def test_deployment_auto_commit_default_accepts_valid_idle_timeout(idle_timeout_seconds):
+    config = ServerConfig(
+        user_config_defaults={"auto_commit_policy": {"idle_timeout_seconds": idle_timeout_seconds}}
+    )
+
+    policy = config.user_config_defaults.auto_commit_policy
+    assert policy is not None
+    assert policy["idle_timeout_seconds"] == idle_timeout_seconds
 
 
 async def test_existing_session_observes_updated_account_value(fake_viking_fs):
@@ -316,9 +331,7 @@ async def test_account_settings_admin_api_reads_and_updates_effective_value(
         "agent_evolution": {"enabled": True},
         "acl": {"enabled": True},
     }
-    assert (
-        await service.runtime_config_manager.get_account("default", "agent_evolution")
-    ).enabled
+    assert (await service.runtime_config_manager.get_account("default", "agent_evolution")).enabled
     assert (await service.runtime_config_manager.get_account("default", "acl")).enabled
     assert await service.viking_fs.acl_manager.is_enabled("default")
 
@@ -380,9 +393,7 @@ async def test_account_configuration_exposes_three_state_layer(settings_http):
         json={"settings": {"acl": None}},
     )
     assert removed.status_code == 200, removed.text
-    assert removed.json()["result"]["settings"] == {
-        "github": {"token": "account-token"}
-    }
+    assert removed.json()["result"]["settings"] == {"github": {"token": "account-token"}}
 
     from openviking.server.auth import get_request_context
 
@@ -423,9 +434,7 @@ async def test_cluster_agent_evolution_override_is_account_fallback(settings_htt
         json={"settings": {"agent_evolution": {"enabled": True}}},
     )
     assert updated.status_code == 200, updated.text
-    assert updated.json()["result"]["settings"] == {
-        "agent_evolution": {"enabled": True}
-    }
+    assert updated.json()["result"]["settings"] == {"agent_evolution": {"enabled": True}}
     assert await service.sessions.get_agent_evolution_enabled("default")
 
     await service.runtime_config_manager.patch_account(
@@ -433,9 +442,7 @@ async def test_cluster_agent_evolution_override_is_account_fallback(settings_htt
     )
     assert not await service.sessions.get_agent_evolution_enabled("default")
 
-    await service.runtime_config_manager.patch_account(
-        "default", {"agent_evolution": None}
-    )
+    await service.runtime_config_manager.patch_account("default", {"agent_evolution": None})
     assert await service.sessions.get_agent_evolution_enabled("default")
 
 
@@ -448,9 +455,9 @@ async def test_legacy_admin_configuration_routes_are_deprecated(settings_http):
     legacy = schema["paths"]["/api/v1/admin/accounts/{account_id}/settings"]
     assert legacy["get"]["deprecated"]
     assert legacy["patch"]["deprecated"]
-    assert not schema["paths"][
-        "/api/v1/admin/accounts/{account_id}/configuration"
-    ]["patch"].get("deprecated", False)
+    assert not schema["paths"]["/api/v1/admin/accounts/{account_id}/configuration"]["patch"].get(
+        "deprecated", False
+    )
     assert "/api/v1/admin/configuration" in schema["paths"]
     assert "/api/v1/admin/settings" not in schema["paths"]
 
@@ -485,9 +492,7 @@ async def test_agent_evolution_endpoint_keeps_name_and_uses_account_settings(
 
     assert response.status_code == 200, response.text
     assert response.json()["result"]["enabled"] is True
-    assert (
-        await service.runtime_config_manager.get_account("default", "agent_evolution")
-    ).enabled
+    assert (await service.runtime_config_manager.get_account("default", "agent_evolution")).enabled
 
 
 def test_deprecated_user_agent_evolution_config_is_not_persisted():

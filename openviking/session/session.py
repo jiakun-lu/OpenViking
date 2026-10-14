@@ -415,7 +415,7 @@ class SessionMeta:
 
 
 @dataclass(frozen=True)
-class SessionTimerSnapshot:
+class SessionExpirySnapshot:
     account_id: str
     user_id: str
     session_id: str
@@ -423,8 +423,8 @@ class SessionTimerSnapshot:
     auto_commit_policy: Optional[Dict[str, Any]]
 
 
-class SessionTimerHook(Protocol):
-    async def report_after_append(self, snapshot: SessionTimerSnapshot) -> None: ...
+class SessionExpiryReporter(Protocol):
+    async def report_after_append(self, snapshot: SessionExpirySnapshot) -> None: ...
 
     def record_report_failure(self, reason: str, exc: Optional[Exception] = None) -> None: ...
 
@@ -448,7 +448,7 @@ class Session:
         agent_evolution_enabled_provider: Optional[Callable[[], bool | Awaitable[bool]]] = None,
         memory_policy_provider: Optional[MemoryPolicyProvider] = None,
         vlm_resolver: Optional["VLMResolver"] = None,
-        timer_hook: Optional[SessionTimerHook] = None,
+        expiry_reporter: Optional[SessionExpiryReporter] = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb_manager = vikingdb_manager
@@ -488,7 +488,7 @@ class Session:
         self._memory_policy_provider = memory_policy_provider
         self._usage_reporter = usage_reporter
         self._vlm_resolver = vlm_resolver
-        self._timer_hook = timer_hook
+        self._expiry_reporter = expiry_reporter
 
     async def _get_vlm_config(self):
         if self._vlm_resolver is None:
@@ -734,7 +734,7 @@ class Session:
         lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
             session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
         )
-        snapshot: Optional[SessionTimerSnapshot] = None
+        snapshot: Optional[SessionExpirySnapshot] = None
         snapshot_error: Optional[Exception] = None
         metadata_reload_error: Optional[Exception] = None
         try:
@@ -774,36 +774,36 @@ class Session:
                     ctx=self.ctx,
                 )
             await self._save_meta()
-            if self._timer_hook is not None:
+            if self._expiry_reporter is not None:
                 try:
                     # _save_meta() made this exact in-memory state authoritative
                     # under the Session path lock, even when the preceding reload
                     # failed. Reporting it prevents the previous due time from
-                    # firing early and repairs a missing timer registration.
-                    snapshot = self._build_timer_snapshot_locked()
+                    # firing early and repairs a missing expiry registration.
+                    snapshot = self._build_expiry_snapshot_locked()
                 except Exception as exc:
                     snapshot_error = exc
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
-        if self._timer_hook is not None:
+        if self._expiry_reporter is not None:
             if metadata_reload_error is not None:
                 logger.warning(
                     "Session metadata reload failed before append; reporting repaired state",
                     exc_info=metadata_reload_error,
                 )
             if snapshot is not None:
-                await self._timer_hook.report_after_append(snapshot)
+                await self._expiry_reporter.report_after_append(snapshot)
             else:
-                self._timer_hook.record_report_failure("snapshot_build_failed", snapshot_error)
+                self._expiry_reporter.record_report_failure("snapshot_build_failed", snapshot_error)
 
-    def _build_timer_snapshot_locked(self) -> SessionTimerSnapshot:
+    def _build_expiry_snapshot_locked(self) -> SessionExpirySnapshot:
         if not self._meta.last_message_at:
             raise ValueError("Session last_message_at is missing")
         account_id = self._meta.created_by_account_id or self.ctx.account_id
         user_id = self._meta.created_by_user_id or self.ctx.user.user_id
         if not account_id or not user_id:
             raise ValueError("Session owner identity is incomplete")
-        return SessionTimerSnapshot(
+        return SessionExpirySnapshot(
             account_id=account_id,
             user_id=user_id,
             session_id=self.session_id,

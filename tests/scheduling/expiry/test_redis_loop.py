@@ -38,6 +38,9 @@ def runtime(io, store):
     result._tasks = {}
     result._storage_started = True
     result._storage_closed = False
+    result._storage_owned = True
+    result._store_open_attempted = True
+    result._storage_start_task = None
     result._store = store
     result._io = io
     result._shard_runner = Runner()
@@ -179,6 +182,47 @@ async def test_executor_propagates_remote_result_or_exception_and_closes_cleanly
     finally:
         await io.close(2.0)
     assert not thread.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_quiesce_atomically_rejects_request_before_registration():
+    io = RedisLoopExecutor(max_inflight=1, request_budget_seconds=1.0)
+    await io.start()
+    submit_entered = threading.Event()
+    allow_submit = threading.Event()
+    operation_started = threading.Event()
+    original_submit = io._submit
+
+    def delayed_submit(operation, *, cleanup=False):
+        submit_entered.set()
+        allow_submit.wait()
+        return original_submit(operation, cleanup=cleanup)
+
+    io._submit = delayed_submit
+
+    async def operation():
+        operation_started.set()
+
+    def run_from_thread():
+        try:
+            asyncio.run(io.run(operation))
+        except BaseException as exc:
+            return exc
+        return None
+
+    request = asyncio.create_task(asyncio.to_thread(run_from_thread))
+    try:
+        assert await asyncio.to_thread(submit_entered.wait, 2.0)
+        await io.quiesce(0.1)
+        allow_submit.set()
+        result = await asyncio.wait_for(request, timeout=2.0)
+        assert isinstance(result, StoreOperationError)
+        assert result.code == "not_started"
+        assert not operation_started.is_set()
+    finally:
+        allow_submit.set()
+        await asyncio.gather(request, return_exceptions=True)
+        await io.close(2.0)
 
 
 @pytest.mark.asyncio

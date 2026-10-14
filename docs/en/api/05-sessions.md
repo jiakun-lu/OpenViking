@@ -48,15 +48,15 @@ Create a new session. Sessions are containers for conversations, storing message
 
 `auto_commit_policy` fields (all optional; omitted fields fall back to the defaults when a policy is present):
 
-| Field | Type | Default | Max | Description |
-|-------|------|---------|-----|-------------|
-| `pending_token_threshold` | int | 150000 | 1000000 | When uncommitted pending tokens exceed this value (strictly greater-than), an auto commit is triggered after a message write. |
-| `message_count_threshold` | int | 100 | 1000 | When the uncommitted live message count exceeds this value (strictly greater-than), an auto commit is triggered after a message write. |
-| `idle_timeout_seconds` | int | 86400 | 604800 | After this many idle seconds, a session with uncommitted content becomes eligible for the server-side idle scheduler. An idle-timeout commit archives the full backlog and ignores `keep_recent_count`. |
-| `keep_recent_count` | int | 0 | 500 | Number of recent live messages to keep (not archived) on a threshold-triggered auto commit. Idle-timeout commits ignore this and commit everything. |
-| `min_commit_interval_seconds` | int | 0 | 604800 | Minimum seconds between two automatic commits (throttle). |
+| Field | Type | Default | Min | Max | Description |
+|-------|------|---------|-----|-----|-------------|
+| `pending_token_threshold` | int | 150000 | 0 | 1000000 | When uncommitted pending tokens exceed this value (strictly greater-than), an auto commit is triggered after a message write. |
+| `message_count_threshold` | int | 100 | 0 | 1000 | When the uncommitted live message count exceeds this value (strictly greater-than), an auto commit is triggered after a message write. |
+| `idle_timeout_seconds` | int | 86400 | 0 (off) or 300 | 604800 | After this many idle seconds, a session with uncommitted content becomes eligible for the server-side idle scheduler. An idle-timeout commit archives the full backlog and ignores `keep_recent_count`. |
+| `keep_recent_count` | int | 0 | 0 | 500 | Number of recent live messages to keep (not archived) on a threshold-triggered auto commit. Idle-timeout commits ignore this and commit everything. |
+| `min_commit_interval_seconds` | int | 0 | 0 | 604800 | Minimum seconds between two automatic commits (throttle). |
 
-All fields have a minimum of `0` and are clamped into `[0, max]`. Unknown keys are rejected with `InvalidArgumentError`. Idle commits also require `memory.session_auto_commit.enabled` on the server; setting `idle_timeout_seconds` alone does not start the scanner.
+New `idle_timeout_seconds` inputs must be `0` (off) or at least `300`; values above `604800` are clamped to that maximum. For stored-data compatibility, existing positive values below 300 continue to be read unchanged. Other fields have a minimum of `0` and are clamped to their ranges. Unknown keys are rejected with `InvalidArgumentError`. Idle commits also require `memory.session_auto_commit.enabled` on the server; setting `idle_timeout_seconds` alone does not start the scanner.
 
 #### 3. Usage Examples
 

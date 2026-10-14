@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Redis key construction and reversible timer identities."""
+"""Redis key construction and reversible expiry identities."""
 
 from __future__ import annotations
 
@@ -72,36 +72,36 @@ class ExpiryKeys:
     service_key: str
 
     def namespace(self) -> str:
-        return f"resource_timer:namespace:{self.service_key}"
+        return f"expiry:namespace:{self.service_key}"
 
     def metadata(self, item_id: str) -> str:
-        return f"resource_meta:item:{self.service_key}:{item_id}"
+        return f"expiry:metadata:{self.service_key}:{item_id}"
 
     def source(self, shard_id: int) -> str:
-        return f"resource_sche:item_list:{self.service_key}:{shard_id}"
+        return f"expiry:publisher:source:{self.service_key}:{shard_id}"
 
     def control_tag(self, shard_id: int) -> str:
         return f"{{{self.service_key}:{shard_id}}}"
 
     def progress(self, shard_id: int) -> str:
-        return f"resource_sche:process:consume_progress:{self.control_tag(shard_id)}"
+        return f"expiry:publisher:progress:{self.control_tag(shard_id)}"
 
     def registry(self, shard_id: int) -> str:
-        return f"resource_consume:bucket_register:{self.control_tag(shard_id)}"
+        return f"expiry:consumer:registry:{self.control_tag(shard_id)}"
 
     def owner(self, role: OwnerRole, shard_id: int, *, item_type: str | None = None) -> str:
         if role is OwnerRole.SCHEDULER:
             if item_type is not None:
                 raise ValueError("Scheduler owner must not include an item type")
-            return f"resource_timer:owner:{role.value}:{self.control_tag(shard_id)}"
+            return f"expiry:publisher:owner:{self.control_tag(shard_id)}"
         if item_type is None:
             raise ValueError("Callback owner requires an item type")
         validate_item_type(item_type)
-        return f"resource_timer:owner:{role.value}:{item_type}:{self.control_tag(shard_id)}"
+        return f"expiry:consumer:owner:{item_type}:{self.control_tag(shard_id)}"
 
     def bucket(self, ref: BucketRef) -> str:
         return (
-            f"resource_consume:item_list:{self.service_key}:"
+            f"expiry:consumer:bucket:{self.service_key}:"
             f"{ref.item_type}:{ref.shard_id}:{ref.minute_ms}"
         )
 

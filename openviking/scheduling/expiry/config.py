@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -11,13 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ExpiryRedisConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     mode: Literal["standalone", "cluster"] = "standalone"
     endpoints: list[str] = Field(default_factory=list)
-    username: str | None = None
-    password: str | None = None
-    password_env: str | None = None
+    username: str = ""
+    password_env: str = ""
+    password: str = Field(default="", repr=False)
     tls: bool = False
     connect_timeout_seconds: float = Field(default=1.0, gt=0)
     socket_timeout_seconds: float = Field(default=2.0, gt=0)
@@ -27,7 +28,7 @@ class ExpiryRedisConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_connection(self) -> "ExpiryRedisConfig":
-        if self.password is not None and self.password_env is not None:
+        if self.password and self.password_env:
             raise ValueError("Redis password and password_env are mutually exclusive")
         if self.mode == "standalone" and len(self.endpoints) > 1:
             raise ValueError("standalone Redis accepts at most one endpoint")
@@ -38,25 +39,48 @@ class ExpiryRedisConfig(BaseModel):
                 if "://" in endpoint
                 else (("rediss" if self.tls else "redis") + f"://{endpoint}")
             )
-            parsed = urlsplit(normalized)
-            if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname or not parsed.port:
-                raise ValueError(f"invalid Redis endpoint: {endpoint}")
-            if parsed.username or parsed.password or parsed.path not in {"", "/"}:
-                raise ValueError("Redis endpoints must not contain credentials or paths")
+            try:
+                parsed = urlsplit(normalized)
+                valid_address = bool(parsed.hostname and parsed.port)
+            except ValueError:
+                # urlsplit/.port errors can echo untrusted endpoint fragments.
+                raise ValueError("invalid Redis endpoint") from None
+            if parsed.scheme not in {"redis", "rediss"} or not valid_address:
+                raise ValueError("invalid Redis endpoint")
+            if (
+                parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "Redis endpoints must not contain credentials, paths, "
+                    "query parameters, or fragments; use dedicated Redis fields"
+                )
             schemes.add(parsed.scheme)
         if len(schemes) > 1:
             raise ValueError("Redis cluster endpoints must use one transport scheme")
         return self
 
+    def resolve_password(self) -> str | None:
+        if self.password_env.strip():
+            try:
+                return os.environ[self.password_env]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Redis secret environment variable {self.password_env} is not set"
+                ) from exc
+        return self.password if self.password.strip() else None
+
 
 class ExpiryConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     service_name: str = ""
-    reporting_enabled: bool = False
-    scheduler_enabled: bool = False
-    callback_enabled: bool = False
-    shard_count: Literal[512] = 512
+    publisher_separate_process: bool = True
+    shard_count: int = Field(default=128, ge=1, le=512)
+    session_consumer_concurrency: int = Field(default=8, ge=1)
     precision_seconds: Literal[60] = 60
     owner_ttl_seconds: Literal[120] = 120
     owner_renew_interval_seconds: Literal[20] = 20
@@ -68,19 +92,16 @@ class ExpiryConfig(BaseModel):
     shutdown_timeout_seconds: float = Field(default=30.0, gt=0)
     redis: ExpiryRedisConfig = Field(default_factory=ExpiryRedisConfig)
 
-    @property
-    def enabled(self) -> bool:
-        return self.reporting_enabled or self.scheduler_enabled or self.callback_enabled
-
-    @model_validator(mode="after")
-    def validate_roles(self) -> "ExpiryConfig":
-        if self.enabled:
-            if not self.service_name.strip():
-                raise ValueError("expiry.service_name is required when enabled")
-            if not self.redis.endpoints:
-                raise ValueError("expiry.redis.endpoints is required when enabled")
-            if self.redis.request_budget_seconds >= self.owner_renew_interval_seconds:
-                raise ValueError("Redis request budget must be shorter than owner renew interval")
-        if self.callback_enabled and not self.reporting_enabled:
-            raise ValueError("callback_enabled requires reporting_enabled for deferred reports")
-        return self
+    def validate_for_runtime(self) -> None:
+        if not self.service_name.strip():
+            raise ValueError(
+                "expiry.service_name is required when Redis session auto commit is enabled"
+            )
+        if not self.redis.endpoints:
+            raise ValueError(
+                "expiry.redis.endpoints is required when Redis session auto commit is enabled"
+            )
+        if self.redis.mode == "standalone" and len(self.redis.endpoints) != 1:
+            raise ValueError("standalone Redis requires exactly one endpoint")
+        if self.redis.request_budget_seconds >= self.owner_renew_interval_seconds:
+            raise ValueError("Redis request budget must be shorter than owner renew interval")

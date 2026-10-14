@@ -34,7 +34,7 @@ async def _marker_exists(session, archive_uri: str, name: str) -> bool:
         return False
 
 
-class _RecordingTimerHook:
+class _RecordingExpiryReporter:
     def __init__(self) -> None:
         self.snapshots = []
         self.failures = []
@@ -52,8 +52,8 @@ class TestCommit:
     async def test_append_reports_repaired_meta_after_authoritative_reload_failure(
         self, session_with_messages: Session, monkeypatch
     ):
-        hook = _RecordingTimerHook()
-        session_with_messages._timer_hook = hook
+        reporter = _RecordingExpiryReporter()
+        session_with_messages._expiry_reporter = reporter
         session_with_messages.meta.auto_commit_policy = {"idle_timeout_seconds": 60}
         await session_with_messages._save_meta()
         original_read_file = session_with_messages._viking_fs.read_file
@@ -72,10 +72,10 @@ class TestCommit:
         await session_with_messages.add_message_async("user", [TextPart("latest activity")])
 
         assert failed is True
-        assert len(hook.snapshots) == 1
-        assert hook.snapshots[0].last_message_at == session_with_messages.meta.last_message_at
-        assert hook.snapshots[0].auto_commit_policy == {"idle_timeout_seconds": 60}
-        assert hook.failures == []
+        assert len(reporter.snapshots) == 1
+        assert reporter.snapshots[0].last_message_at == session_with_messages.meta.last_message_at
+        assert reporter.snapshots[0].auto_commit_policy == {"idle_timeout_seconds": 60}
+        assert reporter.failures == []
 
     async def test_service_timeout_archives_append_after_check_without_idle_phase1_extensions(
         self, session_with_messages: Session, service, request_context, monkeypatch

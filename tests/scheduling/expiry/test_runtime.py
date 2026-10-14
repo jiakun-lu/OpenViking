@@ -1,11 +1,12 @@
 import asyncio
+import threading
 
 import pytest
 
 from openviking.scheduling.expiry import runtime as runtime_module
 from openviking.scheduling.expiry.config import ExpiryConfig, ExpiryRedisConfig
 from openviking.scheduling.expiry.models import StoreOperationError
-from openviking.scheduling.expiry.runtime import ExpiryRuntime
+from openviking.scheduling.expiry.runtime import ExpiryRuntime, ExpiryRuntimeRoles
 from openviking.scheduling.expiry.service import ExpiryRuntimeState
 from openviking.service.core import OpenVikingService
 
@@ -71,10 +72,241 @@ def runtime(*, pending=False):
     result._tasks = {}
     result._storage_started = True
     result._storage_closed = False
+    result._storage_owned = True
+    result._store_open_attempted = True
+    result._storage_start_task = None
     result._store = Store()
     result._io = IO()
     result._shard_runner = Runner(pending=pending)
     return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["io", "open", "namespace"])
+async def test_cancelled_storage_start_closes_partial_resources(stage):
+    timer_runtime = ExpiryRuntime(
+        ExpiryConfig(service_name="startup-test"), roles=ExpiryRuntimeRoles()
+    )
+    entered = asyncio.Event()
+    original_start = timer_runtime._io.start
+
+    class StartupStore(Store):
+        async def open(self):
+            if stage == "open":
+                entered.set()
+                await asyncio.Event().wait()
+
+        async def ensure_namespace(self, spec):
+            if stage == "namespace":
+                entered.set()
+                await asyncio.Event().wait()
+
+    async def io_start():
+        await original_start()
+        if stage == "io":
+            entered.set()
+            await asyncio.Event().wait()
+
+    timer_runtime._store = StartupStore()
+    timer_runtime._io.start = io_start
+    start_task = asyncio.create_task(timer_runtime.start_storage())
+    thread = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        thread = timer_runtime._io._thread
+        start_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=2.0)
+        assert not timer_runtime._storage_started
+        assert not timer_runtime._storage_owned
+        assert timer_runtime._storage_start_task is None
+        assert not timer_runtime._state.storage_ready
+        assert thread is not None and not thread.is_alive()
+        assert timer_runtime._store.close_calls == (0 if stage == "io" else 1)
+        await timer_runtime.close()
+        assert timer_runtime._store.close_calls == (0 if stage == "io" else 1)
+    finally:
+        await asyncio.gather(start_task, return_exceptions=True)
+        await timer_runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_before_io_loop_is_ready_can_retry_close():
+    timer_runtime = ExpiryRuntime(
+        ExpiryConfig(service_name="startup-test", shutdown_timeout_seconds=0.03),
+        roles=ExpiryRuntimeRoles(),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    original_thread_main = timer_runtime._io._thread_main
+
+    def delayed_thread_main():
+        started.set()
+        release.wait()
+        original_thread_main()
+
+    timer_runtime._io._thread_main = delayed_thread_main
+    start_task = asyncio.create_task(timer_runtime.start_storage())
+    try:
+        assert await asyncio.to_thread(started.wait, 2.0)
+        thread = timer_runtime._io._thread
+        start_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=2.0)
+        assert timer_runtime._storage_owned
+        assert not timer_runtime._storage_started
+        assert thread is not None and thread.is_alive()
+        release.set()
+        await asyncio.wait_for(timer_runtime.close(), timeout=2.0)
+        assert not timer_runtime._storage_owned
+        assert not thread.is_alive()
+    finally:
+        release.set()
+        await asyncio.gather(start_task, return_exceptions=True)
+        await timer_runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_resistant_storage_start_is_retained_for_close_retry():
+    timer_runtime = ExpiryRuntime(
+        ExpiryConfig(service_name="startup-test", shutdown_timeout_seconds=0.02),
+        roles=ExpiryRuntimeRoles(),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class StartupStore(Store):
+        async def open(self):
+            entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+
+        async def ensure_namespace(self, spec):
+            pass
+
+    timer_runtime._store = StartupStore()
+    start_task = asyncio.create_task(timer_runtime.start_storage())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        thread = timer_runtime._io._thread
+        start_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=2.0)
+        assert timer_runtime._storage_owned
+        assert timer_runtime._storage_start_task is not None
+        assert not timer_runtime._storage_start_task.done()
+        assert timer_runtime._store.close_calls == 0
+        with pytest.raises(StoreOperationError, match="Previous expiry storage startup"):
+            await timer_runtime.start_storage()
+        release.set()
+        await asyncio.wait_for(timer_runtime.close(), timeout=2.0)
+        assert timer_runtime._store.close_calls == 1
+        assert not timer_runtime._storage_owned
+        assert thread is not None and not thread.is_alive()
+    finally:
+        release.set()
+        await asyncio.gather(start_task, return_exceptions=True)
+        await timer_runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_start_preserves_failure_and_cleans_storage():
+    timer_runtime = ExpiryRuntime(
+        ExpiryConfig(service_name="startup-test"), roles=ExpiryRuntimeRoles()
+    )
+    failure = RuntimeError("namespace failed")
+
+    class StartupStore(Store):
+        async def open(self):
+            pass
+
+        async def ensure_namespace(self, spec):
+            raise failure
+
+    timer_runtime._store = StartupStore()
+    with pytest.raises(RuntimeError) as error:
+        await timer_runtime.start_storage()
+    assert error.value is failure
+    assert timer_runtime._store.close_calls == 1
+    assert not timer_runtime._storage_owned
+    assert timer_runtime._io._thread is None
+
+
+@pytest.mark.asyncio
+async def test_storage_can_start_again_after_partial_start_cleanup():
+    timer_runtime = ExpiryRuntime(
+        ExpiryConfig(service_name="startup-test"), roles=ExpiryRuntimeRoles()
+    )
+
+    class StartupStore(Store):
+        fail_open = True
+
+        async def open(self):
+            if self.fail_open:
+                raise RuntimeError("open failed")
+
+        async def ensure_namespace(self, spec):
+            pass
+
+    timer_runtime._store = StartupStore()
+    with pytest.raises(RuntimeError, match="open failed"):
+        await timer_runtime.start_storage()
+    timer_runtime._store.fail_open = False
+    try:
+        await timer_runtime.start_storage()
+        assert timer_runtime._storage_started
+        assert timer_runtime._storage_owned
+        assert timer_runtime._state.storage_ready
+        await timer_runtime.start_storage()
+    finally:
+        await timer_runtime.close()
+    assert timer_runtime._store.close_calls == 2
+    assert not timer_runtime._storage_owned
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_with_failed_cleanup_retains_resources_for_retry():
+    timer_runtime = ExpiryRuntime(
+        ExpiryConfig(service_name="startup-test"), roles=ExpiryRuntimeRoles()
+    )
+    entered = asyncio.Event()
+
+    class StartupStore(Store):
+        async def open(self):
+            entered.set()
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("cleanup failed")
+
+    timer_runtime._store = StartupStore()
+    start_task = asyncio.create_task(timer_runtime.start_storage())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        thread = timer_runtime._io._thread
+        start_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=2.0)
+        assert timer_runtime._storage_owned
+        assert not timer_runtime._storage_closed
+        assert thread is not None and thread.is_alive()
+        await timer_runtime.close()
+        assert timer_runtime._store.close_calls == 2
+        assert not timer_runtime._storage_owned
+        assert not thread.is_alive()
+    finally:
+        await asyncio.gather(start_task, return_exceptions=True)
+        await timer_runtime.close()
+
+
+def test_consumer_role_requires_reporting():
+    with pytest.raises(ValueError, match="requires reporting"):
+        ExpiryRuntimeRoles(consume=True)
 
 
 @pytest.mark.asyncio
@@ -96,16 +328,14 @@ async def test_start_roles_creates_one_callback_task_per_item_type(monkeypatch):
     timer_runtime = object.__new__(ExpiryRuntime)
     timer_runtime._storage_started = True
     timer_runtime._state = ExpiryRuntimeState()
-    timer_runtime._config = ExpiryConfig.model_construct(
-        scheduler_enabled=False,
-        callback_enabled=True,
-    )
+    timer_runtime._config = ExpiryConfig.model_construct()
+    timer_runtime._roles = ExpiryRuntimeRoles(report=True, consume=True)
     timer_runtime._registry = Registry()
     timer_runtime._stop = asyncio.Event()
     timer_runtime._store = object()
     timer_runtime._shard_runner = object()
     timer_runtime._metrics = object()
-    timer_runtime._scheduler = None
+    timer_runtime._publisher = None
     timer_runtime._consumers = {}
     spawned = {}
 
@@ -122,6 +352,46 @@ async def test_start_roles_creates_one_callback_task_per_item_type(monkeypatch):
     assert set(spawned) == {"callback:session", "callback:watch"}
     for operation in spawned.values():
         operation.close()
+
+
+@pytest.mark.asyncio
+async def test_start_roles_creates_publisher_only_when_selected(monkeypatch):
+    class Publisher:
+        def __init__(self, store, runner, config, metrics):
+            pass
+
+        async def run(self, stop):
+            await stop.wait()
+
+    class Registry:
+        def freeze(self):
+            return {}
+
+    timer_runtime = object.__new__(ExpiryRuntime)
+    timer_runtime._storage_started = True
+    timer_runtime._state = ExpiryRuntimeState()
+    timer_runtime._config = ExpiryConfig.model_construct()
+    timer_runtime._roles = ExpiryRuntimeRoles(publish=True)
+    timer_runtime._registry = Registry()
+    timer_runtime._stop = asyncio.Event()
+    timer_runtime._store = object()
+    timer_runtime._shard_runner = object()
+    timer_runtime._metrics = object()
+    timer_runtime._publisher = None
+    timer_runtime._consumers = {}
+    spawned = {}
+
+    def spawn_role(name, operation):
+        spawned[name] = operation
+
+    timer_runtime._spawn_role = spawn_role
+    monkeypatch.setattr(runtime_module, "ExpiryPublisher", Publisher)
+
+    await timer_runtime.start_roles()
+
+    assert timer_runtime._publisher is not None
+    assert set(spawned) == {"publisher"}
+    spawned["publisher"].close()
 
 
 @pytest.mark.asyncio
@@ -283,7 +553,7 @@ class SessionService:
         self.adapter = object()
         self.adapter_updates = []
 
-    def set_session_timer_adapter(self, adapter):
+    def set_session_expiry_adapter(self, adapter):
         self.adapter_updates.append(adapter)
         self.adapter = adapter
 

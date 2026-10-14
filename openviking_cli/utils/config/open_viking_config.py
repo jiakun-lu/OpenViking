@@ -457,15 +457,8 @@ class OpenVikingConfig(BaseModel):
 
     def _check_expiry_backend(self) -> None:
         idle = self.memory.session_auto_commit
-        if (
-            idle.enabled
-            and idle.idle_backend == "redis"
-            and not self.expiry.reporting_enabled
-        ):
-            raise ValueError(
-                "memory.session_auto_commit.idle_backend='redis' requires "
-                "expiry.reporting_enabled=true"
-            )
+        if idle.enabled and idle.idle_backend == "redis":
+            self.expiry.validate_for_runtime()
 
     agent_evolution: AgentEvolutionConfig = RuntimeField(
         default_factory=AgentEvolutionConfig,
@@ -498,7 +491,7 @@ class OpenVikingConfig(BaseModel):
         ),
     )
 
-    model_config = {"arbitrary_types_allowed": True}
+    model_config = {"arbitrary_types_allowed": True, "hide_input_in_errors": True}
 
     @classmethod
     def from_dict(cls, config: Dict[str, Any]) -> "OpenVikingConfig":
@@ -585,7 +578,7 @@ class OpenVikingConfig(BaseModel):
                             error=e,
                             path_prefix="memory",
                         )
-                    ) from e
+                    ) from None
             instance._check_expiry_backend()
 
             # Apply parser configurations
@@ -619,7 +612,9 @@ class OpenVikingConfig(BaseModel):
                     )
             return instance
         except ValidationError as e:
-            raise ValueError(format_validation_error(root_model=cls, error=e)) from e
+            # The formatted error omits input values; do not reattach a raw
+            # validation traceback which could expose nested credentials.
+            raise ValueError(format_validation_error(root_model=cls, error=e)) from None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""

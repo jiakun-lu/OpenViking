@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Session business adapter for the generic distributed resource timer."""
+"""Session business adapter for distributed expiry scheduling."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from openviking.scheduling.expiry import (
 )
 from openviking.server.identity import RequestContext, Role
 from openviking.session.auto_commit_policy import AutoCommitPolicy
-from openviking.session.session import SessionTimerSnapshot
+from openviking.session.session import SessionExpirySnapshot
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 
@@ -31,18 +31,22 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def install_session_timer(
-    timer: ExpiryScheduler,
+def install_session_expiry(
+    scheduler: ExpiryScheduler,
     sessions: "SessionService",
     *,
-    reporting_enabled: bool,
+    concurrency: int = 8,
 ) -> None:
-    timer.register_handler(
+    scheduler.register_handler(
         SESSION_ITEM_TYPE,
-        SessionTimeoutHandler(sessions, timer),
-        options=HandlerOptions(concurrency=4, max_attempts=3),
+        SessionTimeoutHandler(sessions, scheduler),
+        options=HandlerOptions(
+            concurrency=concurrency,
+            max_attempts=3,
+            metadata_enabled=False,
+        ),
     )
-    sessions.set_session_timer_adapter(SessionTimerAdapter(timer) if reporting_enabled else None)
+    sessions.set_session_expiry_adapter(SessionExpiryAdapter(scheduler))
 
 
 def effective_idle_timeout(policy: dict | None) -> int | None:
@@ -60,11 +64,11 @@ def timestamp_ms(value: str) -> int:
     return int(parsed.astimezone(timezone.utc).timestamp() * 1000)
 
 
-class SessionTimerAdapter:
-    def __init__(self, timer: ExpiryScheduler) -> None:
-        self._timer = timer
+class SessionExpiryAdapter:
+    def __init__(self, scheduler: ExpiryScheduler) -> None:
+        self._scheduler = scheduler
 
-    def build_report(self, snapshot: SessionTimerSnapshot) -> ExpiryRegistration | None:
+    def build_report(self, snapshot: SessionExpirySnapshot) -> ExpiryRegistration | None:
         timeout = effective_idle_timeout(snapshot.auto_commit_policy)
         if timeout is None:
             return None
@@ -80,11 +84,11 @@ class SessionTimerAdapter:
             mode=ExpiryMode.IDLE_ONESHOT,
         )
 
-    async def report_after_append(self, snapshot: SessionTimerSnapshot) -> None:
+    async def report_after_append(self, snapshot: SessionExpirySnapshot) -> None:
         try:
             report = self.build_report(snapshot)
             if report is not None:
-                await self._timer.report(report)
+                await self._scheduler.report(report)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -92,7 +96,7 @@ class SessionTimerAdapter:
 
     async def unregister_after_delete(self, identity: ItemIdentity) -> None:
         try:
-            await self._timer.unregister(identity)
+            await self._scheduler.unregister(identity)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -100,7 +104,7 @@ class SessionTimerAdapter:
 
     def record_report_failure(self, reason: str, exc: Exception | None = None) -> None:
         logger.warning(
-            "Session timer operation failed reason=%s error=%s",
+            "Session expiry operation failed reason=%s error=%s",
             reason,
             type(exc).__name__ if exc is not None else "unknown",
             exc_info=exc is not None,
@@ -108,9 +112,9 @@ class SessionTimerAdapter:
 
 
 class SessionTimeoutHandler:
-    def __init__(self, sessions: "SessionService", timer: ExpiryScheduler) -> None:
+    def __init__(self, sessions: "SessionService", scheduler: ExpiryScheduler) -> None:
         self._sessions = sessions
-        self._timer = timer
+        self._scheduler = scheduler
 
     async def handle(self, request: CallbackRequest) -> CallbackResult:
         result = await self._sessions.commit_on_timeout(
@@ -124,7 +128,7 @@ class SessionTimeoutHandler:
     async def _report_deferred(self, identity: ItemIdentity, result: dict[str, Any]) -> None:
         if result.get("reason") not in {"idle_cooldown", "idle_activity"}:
             raise ValueError("Unexpected deferred session result")
-        await self._timer.report(
+        await self._scheduler.report(
             ExpiryRegistration(
                 identity=identity,
                 due_at_ms=result["due_at_ms"],

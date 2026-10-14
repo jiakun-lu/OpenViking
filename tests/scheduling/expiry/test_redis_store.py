@@ -1,4 +1,5 @@
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -75,6 +76,250 @@ def store(client):
     return result
 
 
+@pytest.fixture
+async def cluster_store(monkeypatch):
+    cluster = pytest.importorskip("redis.asyncio.cluster")
+    timer_store = store(None)
+    timer_store._config = ExpiryRedisConfig(mode="cluster", endpoints=["127.0.0.1:6379"])
+    ping = AsyncMock(return_value=True)
+    monkeypatch.setattr(cluster.RedisCluster, "ping", ping)
+    await timer_store.open()
+    ping.assert_awaited_once()
+    try:
+        yield timer_store
+    finally:
+        await timer_store.close()
+
+
+def configure_cluster_node(monkeypatch, client, key, execute):
+    cluster = pytest.importorskip("redis.asyncio.cluster")
+    node = cluster.ClusterNode("127.0.0.1", 6379, server_type="primary")
+    manager = client.nodes_manager
+    manager.default_node = node
+    manager.nodes_cache = {node.name: node}
+    manager.slots_cache = {client.keyslot(key): [node]}
+
+    async def initialize(_client):
+        # Replace topology discovery only; execute_command and its retry/routing
+        # loops remain the real redis-py implementation, including after close.
+        _client._initialize = False
+        return _client
+
+    monkeypatch.setattr(cluster.RedisCluster, "initialize", initialize)
+    parser = Mock(spec=type(client.commands_parser))
+    parser.get_keys = AsyncMock(return_value=[key])
+    client.commands_parser = parser
+    monkeypatch.setattr(cluster.ClusterNode, "execute_command", execute)
+    return node
+
+
+@pytest.mark.asyncio
+async def test_cluster_retry_settings_are_local_to_expiry_client(cluster_store):
+    from redis.asyncio import Redis
+    from redis.asyncio.cluster import RedisCluster
+
+    client = cluster_store._client
+    other_cluster = RedisCluster(host="127.0.0.1", port=6379)
+    other_standalone = Redis(host="127.0.0.1", port=6379)
+    try:
+        assert client.cluster_error_retry_attempts == 0
+        assert client.connection_error_retry_attempts == 0
+        assert client.get_retry() is None
+        assert all(
+            node.connection_kwargs["retry"] is None
+            for node in client.nodes_manager.startup_nodes.values()
+        )
+        assert other_cluster.cluster_error_retry_attempts == 3
+        assert other_cluster.connection_error_retry_attempts == 3
+        assert other_cluster.get_retry() is not None
+        assert other_standalone.connection_pool.connection_kwargs["retry"] is None
+    finally:
+        await other_cluster.aclose()
+        await other_standalone.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["DEL", "UNLINK"])
+async def test_cluster_single_key_delete_bypasses_pipeline(
+    monkeypatch, cluster_store, command
+):
+    key = f"single-key-{command.lower()}"
+    calls = []
+
+    async def execute(node, *args, **kwargs):
+        calls.append((node.name, args, kwargs))
+        return 1
+
+    node = configure_cluster_node(monkeypatch, cluster_store._client, key, execute)
+
+    result = await cluster_store._single_key_command(command, key, retry="idempotent")
+
+    assert result == 1
+    assert calls == [(node.name, (command, key), {})]
+
+
+@pytest.mark.asyncio
+async def test_standalone_client_constructor_is_unchanged(monkeypatch):
+    redis_async = pytest.importorskip("redis.asyncio")
+    client = Mock(spec=redis_async.Redis)
+    client.ping = AsyncMock(return_value=True)
+    client.aclose = AsyncMock()
+    factory = Mock(return_value=client)
+    monkeypatch.setattr(redis_async.Redis, "from_url", factory)
+    timer_store = store(None)
+    timer_store._config = ExpiryRedisConfig(endpoints=["127.0.0.1:6379"])
+    try:
+        await timer_store.open()
+        factory.assert_called_once_with(
+            "redis://127.0.0.1:6379",
+            username=None,
+            password=None,
+            decode_responses=True,
+            socket_connect_timeout=1.0,
+            socket_timeout=2.0,
+            max_connections=64,
+        )
+        client.ping.assert_awaited_once()
+    finally:
+        await timer_store.close()
+    client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["claim", "owner"])
+@pytest.mark.parametrize("error_name", ["ConnectionError", "TimeoutError"])
+async def test_cluster_uncertain_write_is_not_replayed(
+    monkeypatch, cluster_store, operation, error_name
+):
+    from redis import exceptions
+
+    bucket = BucketRef("session", 3, 60_000)
+    key = (
+        cluster_store._keys.bucket(bucket)
+        if operation == "claim"
+        else cluster_store._keys.owner(OwnerRole.CALLBACK, 3, item_type="session")
+    )
+    expected_score = encode_claim_score(1, 123)
+    state = {"score": expected_score, "owner": None, "calls": 0}
+
+    async def execute(_node, *args, **kwargs):
+        state["calls"] += 1
+        if operation == "claim":
+            assert args[0] == "EVALSHA"
+            if state["score"] != int(args[-2]):
+                return 0
+            state["score"] = int(args[-1])
+        else:
+            assert args[0] == "SET"
+            if state["owner"] is not None:
+                return False
+            state["owner"] = args[2]
+        # The write takes effect before the response is lost. A second call
+        # would return 0/False and hide the successful first execution.
+        raise getattr(exceptions, error_name)("response lost after write")
+
+    configure_cluster_node(monkeypatch, cluster_store._client, key, execute)
+    with pytest.raises(StoreOperationError, match="response lost") as raised:
+        if operation == "claim":
+            await cluster_store.claim(
+                bucket,
+                BucketItem("item", expected_score),
+                attempt=1,
+                started_at_seconds=200,
+            )
+        else:
+            await cluster_store.try_acquire_owner(
+                OwnerRole.CALLBACK, 3, "token", 120, item_type="session"
+            )
+    assert raised.value.outcome_unknown is True
+    assert state["calls"] == 1
+    if operation == "claim":
+        assert state["score"] == encode_claim_score(1, 200)
+    else:
+        assert state["owner"] == "token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["read", "idempotent"])
+async def test_cluster_safe_operations_still_retry_in_store(monkeypatch, cluster_store, operation):
+    from redis.exceptions import ConnectionError
+
+    calls = []
+    bucket = BucketRef("session", 3, 60_000)
+    key = cluster_store._keys.bucket(bucket)
+
+    async def execute(_node, *args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise ConnectionError("temporary")
+        return "value" if operation == "read" else 1
+
+    configure_cluster_node(monkeypatch, cluster_store._client, key, execute)
+    if operation == "read":
+        assert await cluster_store._command("get", key, retry="read") == "value"
+    else:
+        claim = Claim(bucket, "item", encode_claim_score(1, 123))
+        assert await cluster_store.ack(claim) is True
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redirect", ["MOVED", "ASK"])
+async def test_cluster_redirections_still_work_without_network_replay(
+    monkeypatch, cluster_store, redirect
+):
+    from redis.asyncio.cluster import ClusterNode
+    from redis.exceptions import AskError, MovedError
+
+    client = cluster_store._client
+    key = cluster_store._keys.bucket(BucketRef("session", 3, 60_000))
+    destination = ClusterNode("127.0.0.1", 6380, server_type="primary")
+    calls = []
+
+    async def execute(node, *args, **kwargs):
+        calls.append((node.name, args))
+        if node.port == 6379:
+            error = MovedError if redirect == "MOVED" else AskError
+            raise error(f"{client.keyslot(key)} 127.0.0.1:6380")
+        return "OK" if args[0] == "ASKING" else 1
+
+    source = configure_cluster_node(monkeypatch, client, key, execute)
+    client.nodes_manager.nodes_cache[destination.name] = destination
+    claim = await cluster_store.claim(
+        BucketRef("session", 3, 60_000),
+        BucketItem("item", encode_claim_score(1, 123)),
+        attempt=1,
+        started_at_seconds=200,
+    )
+    assert claim is not None
+    assert claim.claim_score == encode_claim_score(1, 200)
+    assert [name for name, _ in calls] == (
+        [source.name, destination.name]
+        if redirect == "MOVED"
+        else [source.name, destination.name, destination.name]
+    )
+    assert [args[0] for _, args in calls] == (
+        ["EVALSHA", "EVALSHA"] if redirect == "MOVED" else ["EVALSHA", "ASKING", "EVALSHA"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("close failed"), asyncio.CancelledError()])
+async def test_client_reference_is_retained_until_close_succeeds(error):
+    class Client:
+        def __init__(self):
+            self.aclose = AsyncMock(side_effect=[error, None])
+
+    client = Client()
+    timer_store = store(client)
+    with pytest.raises(type(error)):
+        await timer_store.close()
+    assert timer_store._client is client
+    await timer_store.close()
+    assert timer_store._client is None
+    assert client.aclose.await_count == 2
+
+
 @pytest.mark.asyncio
 async def test_safe_command_retries_transient_redis_failure():
     client = FlakyClient([ConnectionError("temporary")])
@@ -117,12 +362,36 @@ async def test_evalsha_falls_back_to_eval_on_cache_miss():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delete_metadata", [True, False])
+async def test_unregister_optionally_deletes_metadata(monkeypatch, delete_metadata):
+    timer_store = store(FlakyClient([]))
+    command = AsyncMock()
+    single_key_command = AsyncMock()
+    monkeypatch.setattr(timer_store, "_command", command)
+    monkeypatch.setattr(timer_store, "_single_key_command", single_key_command)
+
+    await timer_store.unregister_resource(3, "item", delete_metadata=delete_metadata)
+
+    assert [call.args for call in command.await_args_list] == [
+        ("zrem", timer_store._keys.source(3), "item")
+    ]
+    if delete_metadata:
+        single_key_command.assert_awaited_once_with(
+            "DEL",
+            timer_store._keys.metadata("item"),
+            retry="idempotent",
+        )
+    else:
+        single_key_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_bucket_reset_uses_single_key_cluster_commands(monkeypatch):
     timer_store = store(FlakyClient([]))
     monkeypatch.setattr(timer_store, "assert_owner", AsyncMock())
     monkeypatch.setattr(timer_store, "read_progress", AsyncMock(return_value=0))
-    command = AsyncMock()
-    monkeypatch.setattr(timer_store, "_command", command)
+    single_key_command = AsyncMock()
+    monkeypatch.setattr(timer_store, "_single_key_command", single_key_command)
 
     await timer_store.reset_unpublished_minute(
         OwnerToken(OwnerRole.SCHEDULER, 3, "owner", 999),
@@ -131,9 +400,9 @@ async def test_bucket_reset_uses_single_key_cluster_commands(monkeypatch):
         item_types=("session", "watch"),
     )
 
-    assert [call.args[:2] for call in command.await_args_list] == [
-        ("unlink", timer_store._keys.bucket(BucketRef("session", 3, 60_000))),
-        ("unlink", timer_store._keys.bucket(BucketRef("watch", 3, 60_000))),
+    assert [call.args[:2] for call in single_key_command.await_args_list] == [
+        ("UNLINK", timer_store._keys.bucket(BucketRef("session", 3, 60_000))),
+        ("UNLINK", timer_store._keys.bucket(BucketRef("watch", 3, 60_000))),
     ]
 
 

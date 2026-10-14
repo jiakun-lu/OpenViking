@@ -14,7 +14,9 @@ from openviking.session.auto_commit_policy import (
     MAX_IDLE_TIMEOUT_SECONDS,
     MAX_MESSAGE_COUNT_THRESHOLD,
     MAX_PENDING_TOKEN_THRESHOLD,
+    MIN_IDLE_TIMEOUT_SECONDS,
     AutoCommitPolicy,
+    validate_idle_timeout_input,
 )
 from openviking_cli.exceptions import InvalidArgumentError
 
@@ -81,6 +83,24 @@ def test_from_dict_clamps_negatives_to_zero():
         "keep_recent_count": 0,
         "min_commit_interval_seconds": 0,
     }
+
+
+def test_from_dict_preserves_legacy_idle_timeout_below_write_minimum():
+    policy = AutoCommitPolicy.from_dict({"idle_timeout_seconds": 60})
+
+    assert policy.idle_timeout_seconds == 60
+
+
+@pytest.mark.parametrize("value", [0, 300, 604800])
+def test_validate_idle_timeout_input_accepts_zero_or_at_least_minimum(value):
+    assert validate_idle_timeout_input(value) == value
+    assert MIN_IDLE_TIMEOUT_SECONDS == 300
+
+
+@pytest.mark.parametrize("value", [-1, 1, 299])
+def test_validate_idle_timeout_input_rejects_nonzero_values_below_minimum(value):
+    with pytest.raises(ValueError, match="must be 0 or at least 300"):
+        validate_idle_timeout_input(value)
 
 
 def test_from_dict_rejects_unknown_keys():

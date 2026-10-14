@@ -56,7 +56,9 @@ class _ExpirySchedulerFacade:
             item_id = encode_item_id(task.identity)
             shard_id = shard_for(item_id, self._shard_count)
             result = await self._store.upsert_resource(shard_id, item_id, task)
-            await self._store.ensure_metadata(item_id, task)
+            binding = self._registry.get(task.identity.item_type)
+            if binding is None or binding.options.metadata_enabled:
+                await self._store.ensure_metadata(item_id, task)
         except StoreOperationError as exc:
             raise self._business_error(exc) from exc
         self._metrics.count("timer_report", item_type=task.identity.item_type, outcome="written")
@@ -68,7 +70,12 @@ class _ExpirySchedulerFacade:
         self._ensure_supported_type(identity.item_type)
         item_id = encode_item_id(identity)
         try:
-            await self._store.unregister_resource(shard_for(item_id, self._shard_count), item_id)
+            binding = self._registry.get(identity.item_type)
+            await self._store.unregister_resource(
+                shard_for(item_id, self._shard_count),
+                item_id,
+                delete_metadata=binding is None or binding.options.metadata_enabled,
+            )
         except StoreOperationError as exc:
             raise self._business_error(exc) from exc
 

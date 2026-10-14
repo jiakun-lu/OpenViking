@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Awaitable, Callable
 
@@ -20,7 +21,9 @@ from .models import (
 )
 
 ShardProcessor = Callable[["ShardExecution", asyncio.Event], Awaitable[None]]
-RunnerScope = tuple[OwnerRole, str | None]
+RunnerScope = tuple[OwnerRole, str | None, int]
+
+logger = logging.getLogger(__name__)
 
 
 class ShardExecution:
@@ -120,7 +123,7 @@ def _consume_exception(task: asyncio.Task[object]) -> None:
 
 
 class ShardRunner:
-    """Run one shard at a time per role, retaining all work that cannot stop."""
+    """Run isolated shard executions while retaining work that cannot stop."""
 
     def __init__(
         self,
@@ -154,8 +157,8 @@ class ShardRunner:
         *,
         item_type: str | None = None,
     ) -> bool:
-        scope = (role, item_type)
-        if scope in self._active or any(not task.done() for task in self._pending.get(scope, ())):
+        scope = (role, item_type, shard_id)
+        if scope in self._active:
             raise self._not_stopped(scope)
         if stop.is_set():
             return False
@@ -256,11 +259,11 @@ class ShardRunner:
             for task in local_tasks:
                 if not task.done():
                     task.cancel()
-            await self._settle(scope, local_tasks)
+            await self._settle(scope, local_tasks, allow_orphans=True)
 
         # task.done() is terminal even if the task raised an ordinary exception.
         # Read the exception before deciding release, then propagate it afterwards.
-        if not processor.cancelled():
+        if processor.done() and not processor.cancelled():
             error = error or processor.exception()
         error = error or execution._error
         unknown = execution._outcome_unknown or (
@@ -298,7 +301,13 @@ class ShardRunner:
             finally:
                 renewing.clear()
 
-    async def _settle(self, scope: RunnerScope, tasks: set[asyncio.Task]) -> None:
+    async def _settle(
+        self,
+        scope: RunnerScope,
+        tasks: set[asyncio.Task],
+        *,
+        allow_orphans: bool = False,
+    ) -> None:
         """Never couple the deadline to completion of a cancelled task."""
         if not tasks:
             return
@@ -329,8 +338,24 @@ class ShardRunner:
             retained.discard(task)
         if not retained and self._pending.get(scope) is retained:
             self._pending.pop(scope)
-        if any(not task.done() for task in tasks):
-            self._metrics.count("timer_shard_stop", outcome="pending")
+        orphaned = sum(not task.done() for task in tasks)
+        if orphaned:
+            role, item_type, shard_id = scope
+            self._metrics.count(
+                "timer_shard_orphaned",
+                orphaned,
+                item_type=item_type or "",
+                outcome=role.value,
+            )
+            logger.warning(
+                "expiry shard execution left orphaned tasks role=%s item_type=%s "
+                "shard_id=%d count=%d",
+                role.value,
+                item_type or "",
+                shard_id,
+                orphaned,
+            )
+        if orphaned and not allow_orphans:
             raise self._not_stopped(scope)
 
     def _pending_done(
@@ -346,8 +371,9 @@ class ShardRunner:
 
     @staticmethod
     def _not_stopped(scope: RunnerScope) -> StoreOperationError:
-        role, item_type = scope
+        role, item_type, shard_id = scope
         label = role.value if item_type is None else f"{role.value}:{item_type}"
         return StoreOperationError(
-            "shard_not_stopped", f"The {label} shard still has active local work"
+            "shard_not_stopped",
+            f"The {label} shard {shard_id} still has active local work",
         )

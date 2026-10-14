@@ -78,9 +78,9 @@ def config(**overrides):
     return ExpiryConfig.model_construct(**values)
 
 
-def runner(store, timer_config=None):
+def runner(store, timer_config=None, metrics=None):
     timer_config = timer_config or config()
-    metrics = ExpiryMetrics()
+    metrics = metrics or ExpiryMetrics()
     coordinator = ShardLeaseCoordinator(store, timer_config, metrics)
     return ShardRunner(coordinator, timer_config, metrics)
 
@@ -368,9 +368,11 @@ async def test_processor_exception_releases_active_lease():
 
 
 @pytest.mark.asyncio
-async def test_cancellation_resistant_processor_is_bounded_retained_and_blocks_same_role():
+async def test_cancellation_resistant_processor_is_retained_without_blocking_new_executions():
     store = Store()
-    shard_runner = runner(store, config(shutdown_timeout_seconds=0.02))
+    events = []
+    metrics = ExpiryMetrics(lambda name, value, labels: events.append((name, value, labels)))
+    shard_runner = runner(store, config(shutdown_timeout_seconds=0.02), metrics)
     stop = asyncio.Event()
     started = asyncio.Event()
     cancelled = asyncio.Event()
@@ -400,21 +402,21 @@ async def test_cancellation_resistant_processor_is_bounded_retained_and_blocks_s
         assert run_task in finished, (
             "Cleanup must not wait indefinitely for cancellation resistance"
         )
-        with pytest.raises(StoreOperationError) as error:
-            run_task.result()
-        assert error.value.code == "shard_not_stopped"
+        assert run_task.result() is True
         assert shard_runner.has_pending is True
         gc.collect()
         assert process_refs[0]() is not None
         assert not process_refs[0]().done()
         assert await asyncio.wait_for(shard_runner.wait_pending(0.01), timeout=2.0) is False
-        acquisition_count = len(store.acquired)
-        with pytest.raises(StoreOperationError) as error:
-            await shard_runner.run_if_acquired(OwnerRole.SCHEDULER, 1, completed, asyncio.Event())
-        assert error.value.code == "shard_not_stopped"
-        assert len(store.acquired) == acquisition_count
         assert store.released == []
-        # Pending work blocks only its own role.
+        assert (
+            await shard_runner.run_if_acquired(OwnerRole.SCHEDULER, 1, completed, asyncio.Event())
+            is True
+        )
+        assert (
+            await shard_runner.run_if_acquired(OwnerRole.SCHEDULER, 0, completed, asyncio.Event())
+            is True
+        )
         assert (
             await shard_runner.run_if_acquired(
                 OwnerRole.CALLBACK,
@@ -425,6 +427,10 @@ async def test_cancellation_resistant_processor_is_bounded_retained_and_blocks_s
             )
             is True
         )
+        assert any(
+            name == "timer_shard_orphaned" and value == 1 and labels["outcome"] == "scheduler"
+            for name, value, labels in events
+        )
         release_process.set()
         assert await asyncio.wait_for(shard_runner.wait_pending(1.0), timeout=2.0) is True
         assert shard_runner.has_pending is False
@@ -432,7 +438,7 @@ async def test_cancellation_resistant_processor_is_bounded_retained_and_blocks_s
             await shard_runner.run_if_acquired(OwnerRole.SCHEDULER, 0, completed, asyncio.Event())
             is True
         )
-        assert len(store.released) == 2
+        assert len(store.released) == 4
     finally:
         stop.set()
         release_process.set()
@@ -486,9 +492,7 @@ async def test_lease_loss_cancels_spawned_child_and_prevents_late_ack():
         await asyncio.wait_for(child_cancelled.wait(), timeout=2.0)
         finished, _ = await asyncio.wait({run_task}, timeout=0.3)
         assert run_task in finished
-        with pytest.raises(StoreOperationError) as error:
-            run_task.result()
-        assert error.value.code == "shard_not_stopped"
+        assert run_task.result() is True
         assert shard_runner.has_pending is True
         assert store.released == []
         called = []

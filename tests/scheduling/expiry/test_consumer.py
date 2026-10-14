@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from openviking.scheduling.expiry import consumer as consumer_module
 from openviking.scheduling.expiry.api import (
     CallbackResult,
     CallbackStatus,
@@ -181,12 +182,19 @@ def config(**overrides):
     return ExpiryConfig.model_construct(**values)
 
 
-def consumer(store, handler, *, max_attempts=3, metrics=None):
+def consumer(store, handler, *, max_attempts=3, metadata_enabled=True, metrics=None):
     timer_config = config()
     metrics = metrics or ExpiryMetrics()
     coordinator = ShardLeaseCoordinator(store, timer_config, metrics)
     shard_runner = ShardRunner(coordinator, timer_config, metrics)
-    binding = HandlerBinding(handler, HandlerOptions(concurrency=1, max_attempts=max_attempts))
+    binding = HandlerBinding(
+        handler,
+        HandlerOptions(
+            concurrency=1,
+            max_attempts=max_attempts,
+            metadata_enabled=metadata_enabled,
+        ),
+    )
     return (
         ExpiryConsumer(
             store,
@@ -265,6 +273,31 @@ async def test_completed_callback_with_missing_metadata_acks_claim_and_releases_
 
 
 @pytest.mark.asyncio
+async def test_completed_callback_skips_metadata_lookup_when_disabled():
+    store = Store()
+    handler = Handler()
+    handler.release.set()
+    resource_consumer, shard_runner = consumer(store, handler, metadata_enabled=False)
+
+    assert (
+        await asyncio.wait_for(
+            shard_runner.run_if_acquired(
+                OwnerRole.CALLBACK,
+                0,
+                resource_consumer.process_shard,
+                asyncio.Event(),
+                item_type="session",
+            ),
+            timeout=2.0,
+        )
+        is True
+    )
+    assert [request.identity for request in handler.requests] == [store.identity]
+    assert store.metadata_reads == []
+    assert store.acked == [store.claims[0]]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["retry", "exception"])
 @pytest.mark.parametrize("last_attempt", [False, True])
 async def test_failed_callback_advances_immediately_and_acks_after_last_attempt(
@@ -288,7 +321,7 @@ async def test_failed_callback_advances_immediately_and_acks_after_last_attempt(
     )
     try:
         await asyncio.wait_for(handler.started.wait(), timeout=2.0)
-        callback_tasks = set(resource_consumer._state.tasks)
+        callback_tasks = set(resource_consumer._callback_tasks)
         assert callback_tasks
         handler.release.set()
         await asyncio.wait_for(handler.finished.wait(), timeout=2.0)
@@ -578,6 +611,7 @@ async def test_owner_loss_keeps_resistant_callback_pending_and_prevents_late_ack
             item_type="session",
         )
     )
+    next_run = None
     try:
         await asyncio.wait_for(handler.started.wait(), timeout=2.0)
         await asyncio.wait_for(store.renew_started.wait(), timeout=2.0)
@@ -587,29 +621,46 @@ async def test_owner_loss_keeps_resistant_callback_pending_and_prevents_late_ack
         assert run_task in finished, (
             "Consumer cleanup must not join a resistant callback indefinitely"
         )
-        with pytest.raises(StoreOperationError) as error:
-            run_task.result()
-        assert error.value.code == "shard_not_stopped"
+        assert run_task.result() is True
         assert shard_runner.has_pending is True
         assert await asyncio.wait_for(shard_runner.wait_pending(0.01), timeout=2.0) is False
         assert store.acked == []
         assert store.released == []
-        # The pending child still owns its reserved slot; do not reset local
-        # accounting while its cancellation has not completed.
-        assert resource_consumer._state.reserved == 1
+        assert len(resource_consumer._callback_tasks) == 1
+
+        store.lose_on_renew = False
+        store.now_ms += 3_000
+        next_run = asyncio.create_task(
+            shard_runner.run_if_acquired(
+                OwnerRole.CALLBACK,
+                0,
+                resource_consumer.process_shard,
+                asyncio.Event(),
+                item_type="session",
+            )
+        )
+
+        async def wait_for_second_callback():
+            while len(handler.requests) < 2:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_second_callback(), timeout=2.0)
+        assert len(resource_consumer._callback_tasks) == 2
+
         handler.release.set()
+        assert await asyncio.wait_for(next_run, timeout=2.0) is True
         assert await asyncio.wait_for(shard_runner.wait_pending(1.0), timeout=2.0) is True
         assert handler.finished.is_set()
-        assert store.acked == []
-        assert store.released == []
-        assert resource_consumer._state.reserved == 0
-        assert not resource_consumer._state.tasks
+        assert store.acked == [store.claims[1]]
+        assert len(store.released) == 1
+        assert not resource_consumer._callback_tasks
         assert shard_runner.has_pending is False
     finally:
         stop.set()
         store.allow_renew.set()
         handler.release.set()
-        await asyncio.wait_for(asyncio.gather(run_task, return_exceptions=True), timeout=2.0)
+        tasks = [run_task] if next_run is None else [run_task, next_run]
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2.0)
         assert await asyncio.wait_for(shard_runner.wait_pending(1.0), timeout=2.0) is True
 
 
@@ -639,16 +690,31 @@ async def test_consumer_worker_does_not_enter_runner_when_already_stopped():
 
 
 @pytest.mark.asyncio
-async def test_consumer_worker_propagates_pending_work_instead_of_acquiring_next_shard():
+async def test_consumer_worker_warns_and_continues_after_unfinished_shard(monkeypatch):
     shard_runner = Runner(
         stop_on_shard=1,
         error=StoreOperationError("shard_not_stopped", "callback still running"),
     )
     resource_consumer = worker_consumer(Store(empty=True), shard_runner, config(shard_count=3))
-    with pytest.raises(StoreOperationError) as error:
-        await asyncio.wait_for(resource_consumer.run(asyncio.Event()), timeout=2.0)
-    assert error.value.code == "shard_not_stopped"
-    assert len(shard_runner.calls) == 1
+    events = []
+    resource_consumer._metrics = ExpiryMetrics(
+        lambda name, value, labels: events.append((name, value, labels))
+    )
+    warnings = []
+    monkeypatch.setattr(
+        consumer_module.logger,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    await asyncio.wait_for(resource_consumer.run(asyncio.Event()), timeout=2.0)
+
+    assert [shard_id for _, _, shard_id, _ in shard_runner.calls] == [0, 1]
+    assert any(
+        name == "timer_shard_round" and labels["outcome"] == "orphaned"
+        for name, _, labels in events
+    )
+    assert warnings
 
 
 @pytest.mark.asyncio

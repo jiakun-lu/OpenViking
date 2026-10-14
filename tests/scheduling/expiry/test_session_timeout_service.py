@@ -87,7 +87,10 @@ class MetadataFS:
     async def write_file(self, uri, content, *, ctx, **kwargs):
         assert uri == self.meta_uri
         assert self.locked
-        assert kwargs.get("lease_ref") == "lease", "Metadata writes must reuse the held lease"
+        assert kwargs.get("lease_ref") is None, (
+            "Child .meta.json must take its own auto-pathlock under the held "
+            "session-directory lock, not reuse the directory lease"
+        )
         assert self.exists, "Recording acceptance must not recreate a deleted session"
         self.events.append("write")
         if self.write_error is not None:
@@ -603,11 +606,11 @@ async def test_default_legacy_backend_starts_scheduler_without_expiry(legacy_ser
     assert legacy_service._session_auto_commit_scheduler is not None
     assert legacy_service._session_auto_commit_scheduler._running is True
     assert legacy_service._expiry_runtime is None
-    assert legacy_service.sessions._session_timer_adapter is None
+    assert legacy_service.sessions._session_expiry_adapter is None
 
 
 @pytest.fixture
-def enable_timer_without_business_work(monkeypatch):
+def configure_expiry_without_enabling_redis_backend(monkeypatch):
     from openviking.service import core
 
     original_get_config = core.get_openviking_config
@@ -617,7 +620,6 @@ def enable_timer_without_business_work(monkeypatch):
         config.memory.session_auto_commit = SessionAutoCommitConfig(enabled=False)
         config.expiry = ExpiryConfig(
             service_name="unused",
-            reporting_enabled=True,
             redis={"endpoints": ["127.0.0.1:1"]},
         )
         return config
@@ -626,12 +628,12 @@ def enable_timer_without_business_work(monkeypatch):
 
 
 @pytest.fixture
-def timer_without_business_work_service(enable_timer_without_business_work, service):
+def expiry_without_redis_backend_service(configure_expiry_without_enabling_redis_backend, service):
     return service
 
 
 @pytest.mark.asyncio
-async def test_enabled_timer_without_business_work_does_not_start_runtime(
-    timer_without_business_work_service,
+async def test_expiry_config_without_redis_backend_does_not_start_runtime(
+    expiry_without_redis_backend_service,
 ):
-    assert timer_without_business_work_service._expiry_runtime is None
+    assert expiry_without_redis_backend_service._expiry_runtime is None

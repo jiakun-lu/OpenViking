@@ -676,6 +676,75 @@ async def test_auto_commit_policy_rejects_null_fields(client: httpx.AsyncClient)
     assert "auto_commit_policy=null" in resp.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("idle_timeout_seconds", [-1, 1, 299])
+async def test_auto_commit_policy_rejects_new_idle_timeout_below_five_minutes(
+    client: httpx.AsyncClient,
+    idle_timeout_seconds: int,
+):
+    resp = await client.post(
+        "/api/v1/sessions",
+        json={"auto_commit_policy": {"idle_timeout_seconds": idle_timeout_seconds}},
+    )
+
+    assert resp.status_code == 400
+    assert "must be 0 or at least 300" in resp.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("idle_timeout_seconds", [0, 300])
+async def test_auto_commit_policy_accepts_disabled_or_five_minute_idle_timeout(
+    client: httpx.AsyncClient,
+    idle_timeout_seconds: int,
+):
+    resp = await client.post(
+        "/api/v1/sessions",
+        json={"auto_commit_policy": {"idle_timeout_seconds": idle_timeout_seconds}},
+    )
+
+    assert resp.status_code == 200
+    assert (
+        resp.json()["result"]["auto_commit_policy"]["idle_timeout_seconds"] == idle_timeout_seconds
+    )
+
+
+async def test_update_auto_commit_policy_rejects_idle_timeout_below_five_minutes(
+    client: httpx.AsyncClient,
+):
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["result"]["session_id"]
+
+    updated = await client.patch(
+        f"/api/v1/sessions/{session_id}/config",
+        json={"auto_commit_policy": {"idle_timeout_seconds": 299}},
+    )
+
+    assert updated.status_code == 400
+    assert "must be 0 or at least 300" in updated.json()["error"]["message"]
+
+
+async def test_updating_other_policy_field_preserves_legacy_idle_timeout(
+    client: httpx.AsyncClient,
+    service,
+):
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["result"]["session_id"]
+    ctx = RequestContext(user=DEFAULT_USER, role=Role.ADMIN)
+    session = await service.sessions.get(session_id, ctx)
+    await session.update_config(
+        auto_commit_policy={"idle_timeout_seconds": 60},
+        update_auto_commit_policy=True,
+    )
+
+    updated = await client.patch(
+        f"/api/v1/sessions/{session_id}/config",
+        json={"auto_commit_policy": {"message_count_threshold": 25}},
+    )
+
+    assert updated.status_code == 200
+    policy = updated.json()["result"]["auto_commit_policy"]
+    assert policy["idle_timeout_seconds"] == 60
+    assert policy["message_count_threshold"] == 25
+
+
 async def test_auto_created_session_uses_default_policy_when_server_default_enabled(
     client: httpx.AsyncClient,
     service,

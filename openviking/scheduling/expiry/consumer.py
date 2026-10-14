@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
@@ -24,6 +25,8 @@ from .models import (
 from .redis_store import RedisExpiryStore
 from .registry import HandlerBinding
 from .shard_runner import ShardExecution, ShardRunner
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -56,7 +59,7 @@ class ExpiryConsumer:
         self._binding = binding
         self._config = config
         self._metrics = metrics
-        self._state = _ConsumerState()
+        self._callback_tasks: set[asyncio.Task[None]] = set()
         self._next_shard = (
             secrets.randbelow(config.shard_count) if start_shard is None else start_shard
         )
@@ -79,7 +82,18 @@ class ExpiryConsumer:
                     )
                 except StoreOperationError as exc:
                     if exc.code == "shard_not_stopped":
-                        raise
+                        logger.warning(
+                            "expiry consumer skipped unfinished shard execution "
+                            "item_type=%s shard_id=%d",
+                            self._item_type,
+                            shard_id,
+                        )
+                        self._metrics.count(
+                            "timer_shard_round",
+                            item_type=self._item_type,
+                            outcome="orphaned",
+                        )
+                        continue
                     self._metrics.count(
                         "timer_shard_round",
                         item_type=self._item_type,
@@ -99,16 +113,11 @@ class ExpiryConsumer:
                     pass
 
     async def process_shard(self, lease: ShardExecution, stop: asyncio.Event) -> None:
-        self._reset_state()
-        try:
-            bucket = await self._discover_bucket(lease)
-            if bucket is None:
-                return
-            await self._process_bucket(lease, stop, bucket)
-        finally:
-            # The runner retains children which have not actually stopped.
-            if not any(not task.done() for task in self._state.tasks):
-                self._reset_state()
+        state = _ConsumerState()
+        bucket = await self._discover_bucket(lease)
+        if bucket is None:
+            return
+        await self._process_bucket(lease, stop, bucket, state)
 
     async def _discover_bucket(self, lease: ShardExecution) -> BucketRef | None:
         cursor = None
@@ -131,10 +140,11 @@ class ExpiryConsumer:
         lease: ShardExecution,
         stop: asyncio.Event,
         bucket: BucketRef,
+        state: _ConsumerState,
     ) -> None:
         while not stop.is_set():
             lease.ensure_active()
-            available = self._binding.options.concurrency - self._state.reserved
+            available = self._binding.options.concurrency - state.reserved
             scan = _BucketScan()
             redis_now_ms = 0
             if available > 0:
@@ -145,9 +155,10 @@ class ExpiryConsumer:
                     bucket,
                     redis_now_ms=redis_now_ms,
                     available=available,
+                    state=state,
                 )
 
-            active = {task for task in self._state.tasks if not task.done()}
+            active = {task for task in state.tasks if not task.done()}
             if active:
                 await lease.wait(self._config.callback_poll_seconds, stop)
                 continue
@@ -168,7 +179,7 @@ class ExpiryConsumer:
             )
             return
 
-        tasks = {task for task in self._state.tasks if not task.done()}
+        tasks = {task for task in state.tasks if not task.done()}
         if tasks:
             await asyncio.wait(tasks)
             lease.ensure_active()
@@ -180,6 +191,7 @@ class ExpiryConsumer:
         *,
         redis_now_ms: int,
         available: int,
+        state: _ConsumerState,
     ) -> _BucketScan:
         next_poll_at_ms: int | None = None
         started_at_seconds = redis_now_ms // 1000
@@ -216,7 +228,7 @@ class ExpiryConsumer:
                     lease.ensure_active()
                     if claim is None:
                         return _BucketScan(next_poll_at_ms, conflicted=True)
-                    self._start_callback(lease, claim)
+                    self._start_callback(lease, claim, state)
                     available -= 1
                     if available == 0:
                         break
@@ -239,27 +251,36 @@ class ExpiryConsumer:
             )
         return (started_at_seconds + self._config.processing_timeout_seconds) * 1000
 
-    def _start_callback(self, lease: ShardExecution, claim: Claim) -> None:
-        task = lease.spawn(self._callback_operation(lease, claim))
-        self._state.reserved += 1
-        self._state.tasks.add(task)
-        task.add_done_callback(self._state.tasks.discard)
-
-    def _reset_state(self) -> None:
-        if any(not task.done() for task in self._state.tasks):
-            raise StoreOperationError("shard_not_stopped", "Previous callbacks are still running")
-        self._state.tasks.clear()
-        self._state.reserved = 0
+    def _start_callback(
+        self,
+        lease: ShardExecution,
+        claim: Claim,
+        state: _ConsumerState,
+    ) -> None:
+        task = lease.spawn(self._callback_operation(lease, claim, state))
+        state.reserved += 1
+        state.tasks.add(task)
+        self._callback_tasks.add(task)
+        task.add_done_callback(state.tasks.discard)
+        task.add_done_callback(self._callback_tasks.discard)
 
     def _callback_operation(
-        self, lease: ShardExecution, claim: Claim
+        self,
+        lease: ShardExecution,
+        claim: Claim,
+        state: _ConsumerState,
     ) -> Callable[[], Awaitable[None]]:
         async def operation() -> None:
-            await self._execute(lease, claim)
+            await self._execute(lease, claim, state)
 
         return operation
 
-    async def _execute(self, lease: ShardExecution, claim: Claim) -> None:
+    async def _execute(
+        self,
+        lease: ShardExecution,
+        claim: Claim,
+        state: _ConsumerState,
+    ) -> None:
         try:
             try:
                 lease.ensure_active()
@@ -296,7 +317,7 @@ class ExpiryConsumer:
             else:
                 await self._finish_failed_attempt(lease, claim, "callback_retry")
         finally:
-            self._state.reserved = max(0, self._state.reserved - 1)
+            state.reserved = max(0, state.reserved - 1)
 
     async def _finish_failed_attempt(
         self, lease: ShardExecution, claim: Claim, reason: str
@@ -341,6 +362,8 @@ class ExpiryConsumer:
         identity = decode_item_id(claim.item_id)
         if identity.item_type != claim.bucket.item_type:
             raise ExpiryError("invalid_identity", "Bucket type differs from item ID")
+        if not self._binding.options.metadata_enabled:
+            return CallbackRequest(identity)
         metadata = await self._store.read_metadata(claim.item_id)
         if metadata is not None and metadata.identity != identity:
             raise ExpiryError("invalid_identity", "Metadata differs from item ID")
@@ -352,7 +375,7 @@ class ExpiryConsumer:
         return CallbackRequest(identity)
 
     async def drain(self, timeout_seconds: float) -> None:
-        tasks = {task for task in self._state.tasks if not task.done()}
+        tasks = {task for task in self._callback_tasks if not task.done()}
         if not tasks:
             return
         _, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
