@@ -1934,7 +1934,7 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
 | `port` | int | Bind port | `1933` |
 | `auth_mode` | str / null | Built-in modes: `"dev"`, `"api_key"`, `"trusted"`, `"oidc"`, `"ldap"`. When omitted/null, infer `api_key` from a non-empty `root_api_key`; otherwise infer `dev`. | `null` |
 | `root_api_key` | str | Root API key for multi-tenant auth in `api_key` mode. In `trusted` mode it is required on every deployment, including localhost; it does not become the source of user identity | `null` |
-| `account_store.provider` | str | Complete Account store provider. The built-in `"file"` provider owns account, user, group, and API-key records while preserving the existing AGFS JSON registry and process-local lookup indexes. | `"file"` |
+| `account_store.provider` | str | Complete Account store provider. Built-in values are `"file"`, `"mysql"`, and `"redis_mysql"`; it owns account, user, group, and API-key records. `"file"` preserves the existing AGFS JSON registry and owns its process-local lookup indexes. `"redis_mysql"` keeps MySQL authoritative and adds a shared Redis cache for authentication and request identity reads. | `"file"` |
 | `account_store.params` | object | Provider-specific startup parameters. Framework-owned filesystem and File-provider API-key hashing dependencies cannot be overridden here. | `{}` |
 | `profile_enabled` | bool | Whether to allow request-scoped cProfile via `profile=1` on HTTP requests. When disabled, the server ignores that query parameter. When enabled, the CLI can display the returned `profile`, while the Python HTTP client currently triggers profiling but does not automatically attach the top-level `profile` field to most SDK return values. | `false` |
 | `cors_origins` | list | Allowed CORS origins | `["*"]` |
@@ -1948,6 +1948,111 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
 | `user_config_defaults.memory_policy` | object | Deployment default memory extraction policy used when neither the Session nor the User has an explicit policy. | `null` |
 | `user_config_defaults.auto_commit_policy` | object | Deployment default auto-commit policy for newly created sessions without an explicit policy. | `null` |
 | `agent_evolution.enabled` | bool | Startup cluster default for Agent Evolution. Account and Cluster Admin settings may override it at runtime. When enabled, session commits may generate or update cases, trajectories, and experiences according to the session `memory_policy`. Existing memories remain readable and searchable when disabled. | `false` |
+
+The MySQL provider stores a versioned SHA-256 digest of each high-entropy API
+key by default and uses a separate digest index for constant-cost lookup. Set
+`credential_storage` to `"encrypted"` to retain keys in AES-GCM encrypted form
+instead; this requires `credential_encryption_key`, a base64-encoded 32-byte
+key. MySQL never persists API-key plaintext. Hash mode exposes only key prefixes
+in user listings, while encrypted mode can decrypt the key for the same listing
+workflow. `credential_storage` controls the format of newly written credentials;
+existing rows are decoded from their `material` prefix. When migrating from
+encrypted storage to hash storage, retain `credential_encryption_key` until all
+encrypted credentials have been rotated. Replacing that encryption key directly
+is not supported because `aesgcm:v1` records do not carry a key identifier.
+
+Install the MySQL extra and configure the top-level `service_name`. Its value is
+stored in the `service_name` column on every account-store table and is the
+deployment boundary when multiple OpenViking clusters share a database. Changing
+`service_name` selects a different logical account-store partition.
+
+The provider never creates or migrates database tables. Create the normalized
+tables in `openviking/server/account_stores/sql/init.sql` through your normal
+DBA or deployment process before starting the server. Future reviewed schema
+changes are stored as ordered SQL files in
+`openviking/server/account_stores/sql/changes/`. The five `ov_accounts*` table
+names are fixed; use distinct top-level `service_name` values rather than
+separate table prefixes to isolate OpenViking clusters that share a database.
+
+```json
+{
+  "service_name": "production",
+  "server": {
+    "account_store": {
+      "provider": "mysql",
+      "params": {
+        "host": "db.example.com",
+        "user": "openviking",
+        "password": "secret",
+        "database": "openviking",
+        "credential_storage": "encrypted",
+        "credential_encryption_key": "base64-encoded-32-byte-key"
+      }
+    }
+  }
+}
+```
+
+`redis_mysql` requires the `redis-mysql` extra and wraps the same MySQL
+parameters. Its `cache` block follows the top-level `cache` `provider/params`
+shape. The Python client currently supports `standalone`, `cluster`, and
+`sentinel` Redis deployments. It caches API-key bindings, users, per-user group
+IDs, and deletion records for a fixed 60 seconds by default. Cache fills and account mutations
+share an account-scoped Redis lease; normal cache hits do not acquire that
+lease. Mutations commit to MySQL first, then invalidate affected cache entries.
+If Redis is unavailable, the MySQL mutation still succeeds and stale cache
+entries remain valid only until their fixed TTL expires. Cache fills also
+maintain an
+account-scoped, expiry-scored key index. Each indexed cache fill removes expired
+index members, allowing account deletion or recreation to clear only that
+account's current cached users, groups, deletion records, and credential data.
+API-key bindings are checked against account and user credential fences, so
+normal key replacement, revocation, and user deletion invalidate old bindings.
+Redis automatically removes the index when its last sorted-set member is removed.
+Cleanup does not issue a separate index deletion, which could remove a newer
+fill's index after lease loss. Provisioning
+and key replacement clear negative lookups both with and without a user hint.
+Redis connection and command timeouts are configured with
+`cache.params.connect_timeout_ms` and `cache.params.command_timeout_ms`; both
+default to 5000 milliseconds when omitted. These are socket timeouts, not an
+overall request deadline.
+
+```json
+{
+  "server": {
+    "account_store": {
+      "provider": "redis_mysql",
+      "params": {
+        "mysql": {
+          "host": "db.example.com",
+          "user": "openviking",
+          "password": "secret",
+          "database": "openviking"
+        },
+        "cache": {
+          "provider": "redis",
+          "params": {
+            "mode": "sentinel",
+            "endpoints": [
+              "rediss://sentinel-1.example.com:26379",
+              "rediss://sentinel-2.example.com:26379",
+              "rediss://sentinel-3.example.com:26379"
+            ],
+            "master_name": "openviking",
+            "username": "openviking",
+            "password_env": "OPENVIKING_REDIS_PASSWORD",
+            "sentinel_password_env": "OPENVIKING_SENTINEL_PASSWORD",
+            "key_prefix": "ov:account-auth",
+            "ttl_seconds": 60,
+            "lock_ttl_seconds": 60,
+            "lock_wait_seconds": 30
+          }
+        }
+      }
+    }
+  }
+}
+```
 
 Omitting `auth_mode` (or setting it to `null`) selects `api_key` when a non-empty `root_api_key` is configured, and `dev` otherwise. `dev` is allowed only on localhost and accepts requests without authentication. An empty-string `root_api_key` is invalid.
 

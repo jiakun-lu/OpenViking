@@ -620,6 +620,8 @@ class RedisExpiryStore:
             self._client = redis_async.Redis.from_url(endpoint, **kwargs)
         else:
             from redis.asyncio.cluster import ClusterNode, RedisCluster
+            from redis.backoff import NoBackoff
+            from redis.retry import Retry
 
             nodes = []
             use_tls = self._config.tls
@@ -639,7 +641,7 @@ class RedisExpiryStore:
                 startup_nodes=nodes,
                 ssl=use_tls,
                 cluster_error_retry_attempts=0,
-                connection_error_retry_attempts=0,
+                retry=Retry(NoBackoff(), 0),
                 **kwargs,
             )
         try:

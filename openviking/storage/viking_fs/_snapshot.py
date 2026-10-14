@@ -436,7 +436,9 @@ class _SnapshotMixin:
                     ctx=real_ctx,
                 )
             try:
-                result = await self._async_agfs.run("git_restore", **kwargs)
+                result = await self._async_agfs.run(
+                    "git_restore", **kwargs, ctx=self._pathlock_fs_ctx(real_ctx, lease)
+                )
             except GitRestoreWritebackPartialError as exc:
                 # The ref already advanced — capture the exception and
                 # finish the lock scope cleanly. Reindex scheduling and

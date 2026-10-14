@@ -1921,7 +1921,7 @@ ov add-resource ./docs --exclude "*.tmp"
 | `port` | int | 绑定端口 | `1933` |
 | `auth_mode` | str / null | 内置模式：`"dev"`、`"api_key"`、`"trusted"`、`"oidc"`、`"ldap"`。省略或设为 null 时，有非空 `root_api_key` 则推导为 `api_key`，否则为 `dev`。 | `null` |
 | `root_api_key` | str | `api_key` 模式必填的 Root API Key；`trusted` 模式在所有部署中均必填，包括 localhost，不负责解析普通用户身份 | `null` |
-| `account_store.provider` | str | 完整 Account Store Provider。内置 `"file"` Provider，统一持久化 Account、User、Group 和 API Key，兼容现有 AGFS JSON 注册表并维护进程内查询索引。 | `"file"` |
+| `account_store.provider` | str | 完整 Account Store Provider。内置 `"file"`、`"mysql"` 和 `"redis_mysql"`；统一持久化 Account、User、Group 和 API Key。`"file"` 兼容现有 AGFS JSON 注册表，并由 Provider 自身维护进程内查询索引。`"redis_mysql"` 保持 MySQL 为权威存储，并增加共享 Redis 认证和请求身份读取缓存。 | `"file"` |
 | `account_store.params` | object | Provider 启动参数。不能通过这里覆盖框架注入的 VikingFS 和 File Provider API Key Hash 配置。 | `{}` |
 | `profile_enabled` | bool | 是否允许 HTTP 请求通过 `profile=1` 开启请求级 cProfile。关闭时服务端会忽略该请求参数；开启后，CLI 可以显示返回的 `profile`，而 Python HTTP client 默认只触发服务端 profile，不会把顶层 `profile` 字段自动附着到大多数 SDK 返回值上。 | `false` |
 | `cors_origins` | list | CORS 允许的来源 | `["*"]` |
@@ -1935,6 +1935,97 @@ ov add-resource ./docs --exclude "*.tmp"
 | `user_config_defaults.memory_policy` | object | Session 和 User 都未显式配置策略时使用的部署级默认记忆抽取策略。 | `null` |
 | `user_config_defaults.auto_commit_policy` | object | 新建 Session 未显式指定策略时使用的部署级自动 Commit 默认策略。 | `null` |
 | `agent_evolution.enabled` | bool | Agent 进化的集群启动默认值，运行时可由 Account 或 Cluster Admin settings 覆盖。开启时，session commit 可按 session `memory_policy` 生成或更新 cases、trajectories 和 experiences；关闭后已有记忆仍可读取和检索。 | `false` |
+
+MySQL Provider 默认保存高熵 API Key 的带版本 SHA-256 摘要，并通过独立摘要索引
+进行固定成本查询。将 `credential_storage` 设为 `"encrypted"` 可改用 AES-GCM
+可逆加密；此时必须提供 `credential_encryption_key`，其值为 base64 编码的
+32 字节密钥。MySQL 不会持久化 API Key 原文。哈希模式的用户列表只展示 key
+prefix；加密模式可为同一列表工作流解密展示 key。`credential_storage` 仅决定
+新写入凭证的格式，读取时根据每条记录的 `material` 前缀选择解码方式。从加密模式
+迁移到哈希模式时，应保留 `credential_encryption_key`，直到所有旧加密凭证完成
+轮换。`aesgcm:v1` 记录不包含 key id，因此不支持直接替换该加密密钥。
+
+安装 MySQL extra 后，通过顶层 `service_name` 配置部署名称。该值会写入每张
+Account Store 表的 `service_name` 列，并在多个 OpenViking 集群共用一个数据库时
+充当隔离边界。修改 `service_name` 会选择另一组逻辑 Account Store 分区。
+
+Provider 不会创建或迁移数据库表。启动服务前，应通过现有 DBA 或部署流程手工创建
+`openviking/server/account_stores/sql/init.sql` 中定义的规范化表。后续经评审的
+schema 变更按顺序存放于 `openviking/server/account_stores/sql/changes/`。
+五张 `ov_accounts*` 表的名称固定；多个 OpenViking 集群共用数据库时，通过不同的
+顶层 `service_name` 隔离部署，不使用不同表前缀。
+
+```json
+{
+  "service_name": "production",
+  "server": {
+    "account_store": {
+      "provider": "mysql",
+      "params": {
+        "host": "db.example.com",
+        "user": "openviking",
+        "password": "secret",
+        "database": "openviking",
+        "credential_storage": "encrypted",
+        "credential_encryption_key": "base64-encoded-32-byte-key"
+      }
+    }
+  }
+}
+```
+
+`redis_mysql` 需要安装 `redis-mysql` extra，并在参数中嵌套同一份 MySQL 配置。
+其 `cache` 配置沿用顶层 `cache` 的 `provider/params` 结构，目前 Python
+客户端支持 `standalone`、`cluster` 和 `sentinel` 三种 Redis 部署模式。
+它默认以固定 60 秒 TTL 缓存 API Key 绑定、User、每个 User 的 Group ID 和删除记录。
+缓存重建与同一 Account 的修改共用 Redis 租约，正常缓存命中不获取该租约。修改会先
+提交 MySQL，再失效相关缓存。Redis 不可用时 MySQL 修改仍会成功，遗留缓存最多保持到
+固定 TTL 到期。缓存回填同时维护 Account
+级、按过期时间排序的 key 索引；每次写入已索引缓存时会清理过期成员，因此删除或重建
+Account 时只会清理该 Account 当前的 User、Group、删除记录和凭据缓存。API Key 绑定会
+校验 Account 和 User 的凭据 fence，所以正常的换 Key、吊销和删 User 会使旧绑定失效。
+索引的最后一个有序集合成员被移除后，Redis 会自动删除空索引；清理结束时不再单独删除
+索引，避免失去租约的旧请求误删新回填的索引。创建身份或换 Key 会同时清除携带和未携带
+User 提示的负缓存。
+Redis 连接和命令超时通过 `cache.params.connect_timeout_ms` 和
+`cache.params.command_timeout_ms` 配置，未配置时均为 5000 毫秒；这不是整个请求的总超时。
+
+```json
+{
+  "server": {
+    "account_store": {
+      "provider": "redis_mysql",
+      "params": {
+        "mysql": {
+          "host": "db.example.com",
+          "user": "openviking",
+          "password": "secret",
+          "database": "openviking"
+        },
+        "cache": {
+          "provider": "redis",
+          "params": {
+            "mode": "sentinel",
+            "endpoints": [
+              "rediss://sentinel-1.example.com:26379",
+              "rediss://sentinel-2.example.com:26379",
+              "rediss://sentinel-3.example.com:26379"
+            ],
+            "master_name": "openviking",
+            "username": "openviking",
+            "password_env": "OPENVIKING_REDIS_PASSWORD",
+            "sentinel_password_env": "OPENVIKING_SENTINEL_PASSWORD",
+            "key_prefix": "ov:account-auth",
+            "ttl_seconds": 60,
+            "lock_ttl_seconds": 60,
+            "lock_wait_seconds": 30
+          }
+        }
+      }
+    }
+  }
+}
+```
 
 省略 `auth_mode`（或设为 `null`）时，配置了非空 `root_api_key` 则选择 `api_key`，否则选择 `dev`。`dev` 仅允许监听 localhost，不进行身份认证。`root_api_key` 不能配置为空字符串。
 

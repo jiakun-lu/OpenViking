@@ -21,6 +21,7 @@ from openviking.server.config import (
 from openviking.server.dependencies import set_service
 from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import sessions as sessions_router
+from openviking.session.auto_commit_policy import MAX_PENDING_TOKEN_THRESHOLD, AutoCommitPolicy
 from openviking.session.session import Session
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config import OPENVIKING_CONFIG_ENV
@@ -673,13 +674,7 @@ async def test_create_session_uses_default_policy_when_server_default_enabled(
 
     resp = await client.post("/api/v1/sessions", json={})
     assert resp.status_code == 200
-    assert resp.json()["result"]["auto_commit_policy"] == {
-        "pending_token_threshold": 10000,
-        "message_count_threshold": 50,
-        "idle_timeout_seconds": 86400,
-        "keep_recent_count": 2,
-        "min_commit_interval_seconds": 0,
-    }
+    assert resp.json()["result"]["auto_commit_policy"] == AutoCommitPolicy.default().to_dict()
 
 
 async def test_create_session_can_disable_server_default_auto_commit(
@@ -791,13 +786,10 @@ async def test_auto_created_session_uses_default_policy_when_server_default_enab
 
     session_resp = await client.get(f"/api/v1/sessions/{session_id}")
     assert session_resp.status_code == 200
-    assert session_resp.json()["result"]["auto_commit_policy"] == {
-        "pending_token_threshold": 10000,
-        "message_count_threshold": 50,
-        "idle_timeout_seconds": 86400,
-        "keep_recent_count": 2,
-        "min_commit_interval_seconds": 0,
-    }
+    assert (
+        session_resp.json()["result"]["auto_commit_policy"]
+        == AutoCommitPolicy.default().to_dict()
+    )
 
 
 async def test_create_session_applies_config_and_fills_defaults(client: httpx.AsyncClient):
@@ -812,13 +804,9 @@ async def test_create_session_applies_config_and_fills_defaults(client: httpx.As
     )
     assert resp.status_code == 200
     result = resp.json()["result"]
-    assert result["auto_commit_policy"] == {
-        "pending_token_threshold": 8000,
-        "message_count_threshold": 50,
-        "idle_timeout_seconds": 86400,
-        "keep_recent_count": 10,
-        "min_commit_interval_seconds": 0,
-    }
+    expected_policy = AutoCommitPolicy.default().to_dict()
+    expected_policy.update({"pending_token_threshold": 8000, "keep_recent_count": 10})
+    assert result["auto_commit_policy"] == expected_policy
 
     session_resp = await client.get(f"/api/v1/sessions/{result['session_id']}")
     session_result = session_resp.json()["result"]
@@ -833,7 +821,7 @@ async def test_create_session_clamps_config_above_bounds(client: httpx.AsyncClie
     )
     assert resp.status_code == 200
     policy = resp.json()["result"]["auto_commit_policy"]
-    assert policy["pending_token_threshold"] == 50000
+    assert policy["pending_token_threshold"] == MAX_PENDING_TOKEN_THRESHOLD
 
 
 async def test_get_session_returns_effective_config(client: httpx.AsyncClient):

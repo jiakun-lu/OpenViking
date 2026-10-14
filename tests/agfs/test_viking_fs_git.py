@@ -8,8 +8,6 @@ double-encryption invariant called out in the design doc.
 from __future__ import annotations
 
 import asyncio
-import os
-import secrets
 import shutil
 import tempfile
 from pathlib import Path
@@ -439,34 +437,26 @@ async def test_account_isolation_show_misses_other_account(vfs):
 
 
 @pytest.fixture
-def encryptor(workspace):
-    from openviking.crypto.encryptor import FileEncryptor
-    from openviking.crypto.providers import LocalFileProvider
-
-    key_file = workspace / "master.key"
-    key_file.write_text(secrets.token_bytes(32).hex())
-    os.chmod(key_file, 0o600)
-    provider = LocalFileProvider(key_file=str(key_file))
-    return FileEncryptor(provider)
-
-
-@pytest.fixture
-def vfs_encrypted(workspace, encryptor):
+def vfs_encrypted(workspace):
     cfg, fs_root = _write_workspace(workspace)
-    client = _build_client(cfg, fs_root)
+    client = ragfs_python.RAGFSBindingClient(
+        git_config_path=str(cfg),
+        config={
+            "service_name": "snapshot-test",
+            "encryption": {"root_key": b"k" * 32, "provider_type": 1},
+        },
+    )
+    client.mount("localfs", "/local", {"local_dir": str(fs_root)})
     try:
-        yield VikingFS(agfs=client, encryptor=encryptor)
+        yield VikingFS(agfs=client)
     finally:
-        pass
+        client.close()
 
 
 @pytest.mark.asyncio
 async def test_double_encryption_restore_preserves_plaintext(vfs_encrypted):
-    """Write plaintext via encrypted VikingFS, commit (ciphertext stored in
-    git), modify, restore. After restore, VikingFS.read MUST return the
-    original plaintext — proving the Rust restore path bypasses the
-    VikingFS encryption layer (writes ciphertext back through MountableFS,
-    which then decrypts correctly on read).
+    """Restore through the encrypted backend under the outer tree lock;
+    reads must return the original plaintext without double encryption.
     """
     ctx = _make_ctx(account="acct_enc")
     plaintext_v1 = b"top-secret-v1"

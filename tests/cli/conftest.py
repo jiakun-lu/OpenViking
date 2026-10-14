@@ -493,8 +493,6 @@ def ov_add_resource(path, to_uri, *extra_args, attempts=15, interval=10):
         to_uri,
         *extra_args,
         "--wait",
-        "--timeout",
-        ADD_RESOURCE_WAIT_TIMEOUT,
         "-o",
         "json",
     ]

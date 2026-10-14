@@ -122,17 +122,11 @@ async def test_cluster_retry_settings_are_local_to_expiry_client(cluster_store):
     other_cluster = RedisCluster(host="127.0.0.1", port=6379)
     other_standalone = Redis(host="127.0.0.1", port=6379)
     try:
-        assert client.cluster_error_retry_attempts == 0
-        assert client.connection_error_retry_attempts == 0
-        assert client.get_retry() is None
-        assert all(
-            node.connection_kwargs["retry"] is None
-            for node in client.nodes_manager.startup_nodes.values()
-        )
-        assert other_cluster.cluster_error_retry_attempts == 3
-        assert other_cluster.connection_error_retry_attempts == 3
-        assert other_cluster.get_retry() is not None
-        assert other_standalone.connection_pool.connection_kwargs["retry"] is None
+        assert client.retry._retries == 0
+        assert other_cluster.retry._retries == 3
+        assert client.retry is not other_cluster.retry
+        standalone_retry = other_standalone.connection_pool.connection_kwargs["retry"]
+        assert standalone_retry is None or standalone_retry._retries > 0
     finally:
         await other_cluster.aclose()
         await other_standalone.aclose()

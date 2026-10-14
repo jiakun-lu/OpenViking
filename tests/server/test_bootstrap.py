@@ -405,6 +405,7 @@ def test_main_restart_cleans_up_bot_and_preserves_launch_command(monkeypatch, ap
     monkeypatch.setattr(bootstrap, "create_app", lambda *a, **kw: "app")
     monkeypatch.setattr(bootstrap, "_abort_if_port_in_use", lambda *a: None)
     monkeypatch.setattr(bootstrap, "_start_vikingbot_gateway", lambda *a, **kw: "bot")
+    monkeypatch.setattr(bootstrap, "_start_expiry_publisher", lambda *a, **kw: None)
     monkeypatch.setattr(
         bootstrap, "_stop_vikingbot_gateway", lambda bot: steps.append(("stop", bot))
     )

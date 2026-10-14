@@ -320,8 +320,11 @@ class AccountStoreConfig(BaseModel):
     @classmethod
     def _validate_provider(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if not normalized:
-            raise ValueError("account_store.provider must not be empty")
+        supported = {"file", "mysql", "redis_mysql"}
+        if normalized not in supported:
+            raise ValueError(
+                "account_store.provider must be one of: " + ", ".join(sorted(supported))
+            )
         return normalized
 
 
