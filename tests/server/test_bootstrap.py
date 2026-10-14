@@ -11,8 +11,10 @@ import pytest
 
 import openviking.server.app as app_module
 import openviking.server.bootstrap as bootstrap
+from openviking.scheduling.expiry.config import ExpiryConfig
 from openviking.server.config import ServerConfig
 from openviking.utils.agfs_utils import resolve_queuefs_mount_point
+from openviking_cli.utils.config.memory_config import SessionAutoCommitConfig
 from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
 from openviking_cli.utils.config.storage_config import StorageConfig
 
@@ -385,7 +387,9 @@ def test_restartable_server_drains_uvicorn_before_returning(monkeypatch):
 
 
 @pytest.mark.parametrize("app_startup_fails", [False, True])
-def test_main_restart_cleans_up_bot_and_preserves_launch_command(monkeypatch, app_startup_fails):
+def test_main_restart_cleans_up_managed_children_and_preserves_launch_command(
+    monkeypatch, app_startup_fails
+):
     import sys
 
     config = ServerConfig(host="127.0.0.1", port=1933, with_bot=True)
@@ -396,40 +400,66 @@ def test_main_restart_cleans_up_bot_and_preserves_launch_command(monkeypatch, ap
     monkeypatch.setattr(bootstrap, "load_server_config", lambda path: config)
     monkeypatch.setattr(bootstrap, "resolve_config_path", lambda *a: Path("/tmp/explicit.conf"))
     monkeypatch.setattr(
-        OpenVikingConfigSingleton, "initialize", classmethod(lambda cls, **kw: None)
+        OpenVikingConfigSingleton,
+        "initialize",
+        classmethod(
+            lambda cls, **kw: SimpleNamespace(
+                memory=SimpleNamespace(
+                    session_auto_commit=SessionAutoCommitConfig(enabled=True, idle_backend="redis")
+                ),
+                expiry=ExpiryConfig(),
+            )
+        ),
     )
     monkeypatch.setattr(
         "openviking_cli.utils.ollama.detect_ollama_in_config", lambda c: (False, "", 0)
     )
     monkeypatch.setattr(bootstrap, "configure_uvicorn_logging", lambda: None)
-    monkeypatch.setattr(bootstrap, "create_app", lambda *a, **kw: "app")
+
+    def create_app(*args, **kwargs):
+        assert steps == [("start", Path("/tmp/explicit.conf"))]
+        if app_startup_fails:
+            raise RuntimeError("application initialization failed")
+        return "app"
+
+    monkeypatch.setattr(bootstrap, "create_app", create_app)
     monkeypatch.setattr(bootstrap, "_abort_if_port_in_use", lambda *a: None)
     monkeypatch.setattr(bootstrap, "_start_vikingbot_gateway", lambda *a, **kw: "bot")
     monkeypatch.setattr(bootstrap, "_start_expiry_publisher", lambda *a, **kw: None)
     monkeypatch.setattr(
         bootstrap, "_stop_vikingbot_gateway", lambda bot: steps.append(("stop", bot))
     )
+    monkeypatch.setattr(
+        bootstrap,
+        "_start_expiry_publisher",
+        lambda path: steps.append(("start", path)) or "publisher",
+    )
+    monkeypatch.setattr(
+        bootstrap, "_stop_expiry_publisher", lambda child: steps.append(("stop", child))
+    )
     monkeypatch.setattr(bootstrap, "_run_restartable_server", lambda *a, **kw: True)
     monkeypatch.setattr(
         os, "execv", lambda executable, args: steps.append(("exec", executable, args))
     )
     monkeypatch.setenv("OPENVIKING_CONFIG_FILE", "/tmp/explicit.conf")
+    lifecycle = [
+        ("start", Path("/tmp/explicit.conf")),
+        ("stop", "publisher"),
+        ("stop", "bot"),
+    ]
     if app_startup_fails:
-        def fail_app(*args, **kwargs):
-            raise RuntimeError("application initialization failed")
-
-        monkeypatch.setattr(bootstrap, "create_app", fail_app)
         with pytest.raises(RuntimeError, match="application initialization failed"):
             bootstrap.main()
-        assert steps == [("stop", "bot")]
+        assert steps == lifecycle
         return
     bootstrap.main()
-    assert steps == [("stop", "bot"), ("exec", sys.executable, original_argv)]
+    assert steps == [*lifecycle, ("exec", sys.executable, original_argv)]
     assert os.environ["OPENVIKING_CONFIG_FILE"] == "/tmp/explicit.conf"
 
 
-def _run_restart_recovery_probe(tmp_path, monkeypatch, stage):
-    """Run one restart-recovery scenario in an isolated subprocess."""
+@pytest.mark.parametrize("failure", ["bind", "lifespan", "bootstrap", "success", "retry_failure"])
+def test_restart_recovery_through_real_exec(tmp_path, monkeypatch, failure):
+    """Exercise socket/lifespan failures and a single recovery with real execv."""
     import hashlib
     import json
     import socket
@@ -448,7 +478,7 @@ def _run_restart_recovery_probe(tmp_path, monkeypatch, stage):
     with socket.socket() as occupied:
         occupied.bind(("127.0.0.1", 0))
         occupied.listen()
-        path.write_text(json.dumps({"port": occupied.getsockname()[1], "stage": stage}))
+        path.write_text(json.dumps({"port": occupied.getsockname()[1], "stage": failure}))
         # A normal save backup may contain an intermediate, never-started draft.
         path.with_name("ov.conf.studio.bak").write_bytes(b'{"stage":"intermediate"}')
         RestartRecovery().prepare(hashlib.sha256(path.read_bytes()).hexdigest())
@@ -486,36 +516,20 @@ def _run_restart_recovery_probe(tmp_path, monkeypatch, stage):
         """)
         )
         result = subprocess.run(
-            [sys.executable, str(script), str(path), stage],
+            [sys.executable, str(script), str(path), failure],
             env=os.environ.copy(),
             capture_output=True,
             text=True,
             timeout=40,
         )
-    return result, path, backup, original
-
-
-@pytest.mark.parametrize("failure", ["bind", "lifespan", "bootstrap", "retry_failure"])
-def test_restart_recovery_rolls_back_through_real_exec(tmp_path, monkeypatch, failure):
-    """Exercise startup failures and a single rollback with real execv."""
-    result, path, backup, original = _run_restart_recovery_probe(tmp_path, monkeypatch, failure)
     if failure == "retry_failure":
         assert result.returncode != 0
         assert result.stderr.count("retrying once") == 1
         assert path.read_bytes() == original
     else:
         assert result.returncode == 0, result.stderr
-        assert "RECOVERED" in result.stdout
-        assert path.read_bytes() == original
-    assert not backup.exists()
-
-
-def test_restart_recovery_disarms_after_successful_startup(tmp_path, monkeypatch):
-    result, path, backup, original = _run_restart_recovery_probe(tmp_path, monkeypatch, "success")
-
-    assert result.returncode == 0, result.stderr
-    assert "APPLIED" in result.stdout
-    assert path.read_bytes() != original
+        assert ("APPLIED" if failure == "success" else "RECOVERED") in result.stdout
+        assert (path.read_bytes() == original) == (failure != "success")
     assert not backup.exists()
 
 
