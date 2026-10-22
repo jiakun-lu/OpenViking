@@ -601,11 +601,23 @@ class OpenVikingService:
         except Exception:
             session_auto_commit_config = SessionAutoCommitConfig()
         self._session_service.set_session_auto_commit_config(session_auto_commit_config)
-        expiry_config = get_openviking_config().expiry
         session_expiry_enabled = (
             session_auto_commit_config.enabled
             and getattr(session_auto_commit_config, "idle_backend", "local") == "redis"
         )
+        compile_expiry_enabled = getattr(self._config.compile_api, "scheduler_enabled", False)
+        # Local or disabled scheduling must not depend on the optional expiry
+        # configuration. Validate Redis consumers before starting scheduler/queue workers.
+        expiry_config = None
+        if session_expiry_enabled or compile_expiry_enabled:
+            expiry_config = getattr(config, "expiry", None)
+            if expiry_config is None:
+                raise RuntimeError(
+                    "Redis expiry scheduling is enabled, but the loaded OpenVikingConfig "
+                    "has no expiry configuration. Reinstall a complete OpenViking version "
+                    "so the service and configuration modules match."
+                )
+            expiry_config.validate_for_runtime()
         if (
             session_auto_commit_config.enabled
             and getattr(session_auto_commit_config, "idle_backend", "local") == "local"
@@ -630,11 +642,10 @@ class OpenVikingService:
             viking_fs=self._viking_fs,
         )
         self._compile_service.configure_memory_runner(vikingdb=self._vikingdb_manager)
-        compile_config = self._config.compile_api
         compile_store = CompileStateStore(self._agfs_client)
         self._compile_service.configure_lifecycle(CompileLifecycle(compile_store, self._viking_fs))
         get_task_tracker().compile_history_cleanup = compile_store.delete_expired
-        if compile_config.scheduler_enabled:
+        if compile_expiry_enabled:
             self._compile_scheduler = CompileScheduler(
                 self._compile_service,
                 compile_store,
@@ -711,8 +722,7 @@ class OpenVikingService:
             self._queue_manager.start()
             logger.info("QueueManager workers started")
 
-        compile_expiry_enabled = self._compile_scheduler is not None
-        if session_expiry_enabled or compile_expiry_enabled:
+        if expiry_config is not None:
             from openviking.scheduling.expiry.runtime import ExpiryRuntime, ExpiryRuntimeRoles
 
             self._expiry_runtime = ExpiryRuntime(
@@ -729,7 +739,7 @@ class OpenVikingService:
                         self._expiry_runtime.scheduler,
                         consumer_concurrency=expiry_config.session_consumer_concurrency,
                     )
-                if compile_expiry_enabled:
+                if self._compile_scheduler is not None:
                     self._compile_scheduler.install_expiry(self._expiry_runtime.scheduler)
                 await self._expiry_runtime.start_storage()
                 await self._expiry_runtime.start_roles()
