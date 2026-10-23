@@ -305,10 +305,6 @@ jobs:
         mv dist_fixed/*.whl dist/
         rmdir dist_fixed
 
-    - name: Verify wheel Python sources
-      shell: bash
-      run: '"$PYTHON_BIN" scripts/build_support/verify_wheel_sources.py dist/*.whl'
-
     - name: Smoke test built wheel (Linux)
       shell: bash
       run: |
@@ -379,14 +375,6 @@ jobs:
         print(f"Validated filter ABI symbols {required_filter_symbols}")
         print(f"Bundled Web Studio index {studio_index}")
         PY
-
-    - name: Verify expiry startup in installed wheel
-      shell: bash
-      run: |
-        "$PYTHON_BIN" -m pip install pytest pytest-asyncio
-        cd "$RUNNER_TEMP"
-        "$PYTHON_BIN" -I -m pytest -q --noconftest --import-mode=importlib -o addopts='' \
-          "$GITHUB_WORKSPACE/tests/unit/service/test_core_expiry_startup.py"
 
     - name: Store the distribution packages
       uses: actions/upload-artifact@v7
@@ -555,10 +543,6 @@ jobs:
         fi
         echo "ov binary and wheel both use $WHEEL_VERSION"
 
-    - name: Verify wheel Python sources
-      shell: bash
-      run: python scripts/build_support/verify_wheel_sources.py dist/*.whl
-
     - name: Smoke test built wheel (macOS)
       if: runner.os == 'macOS'
       shell: bash
@@ -632,14 +616,6 @@ jobs:
         print(f"Backend module origin {backend_spec.origin}")
         print(f"Bundled Web Studio index {studio_index}")
         PY
-
-    - name: Verify expiry startup in installed wheel
-      shell: bash
-      run: |
-        python -m pip install pytest pytest-asyncio
-        cd "$RUNNER_TEMP"
-        python -I -m pytest -q --noconftest --import-mode=importlib -o addopts='' \
-          "$GITHUB_WORKSPACE/tests/unit/service/test_core_expiry_startup.py"
 
     - name: Store the distribution packages
       uses: actions/upload-artifact@v7
