@@ -58,6 +58,7 @@ def startup(monkeypatch):
     monkeypatch.setattr(core, "get_task_tracker", Mock(return_value=Mock(load=AsyncMock())))
     monkeypatch.setattr(core, "init_context_collection", AsyncMock())
     monkeypatch.setattr(core, "init_viking_fs", Mock())
+    monkeypatch.setattr(core, "SystemAssetSynchronizer", Mock(return_value=Mock(sync=AsyncMock())))
     for name in (
         "ResourceProcessor",
         "UserPrivacyConfigService",
