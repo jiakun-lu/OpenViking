@@ -20,6 +20,61 @@ from openviking_cli.session.user_id import UserIdentifier
 from tests.test_task_tracker import _FakeAgfs
 
 
+def test_compile_accepts_builtin_example_skill():
+    from openviking.service.compile_service import CompileRequest, CompileService
+    from openviking_cli.utils.config.open_viking_config import CompileApiConfig
+
+    service = CompileService(CompileApiConfig(), ExternalTaskService(), SimpleNamespace())
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    request = CompileRequest.model_validate(
+        {
+            "from": ["viking://resources/source"],
+            "to": "viking://resources/wiki",
+            "skill": "viking://system/compile/example-skills/llm-wiki/SKILL.md",
+        }
+    )
+
+    normalized = service._normalize_request_uris(request, ctx)
+
+    assert normalized.skill == "viking://system/compile/example-skills/llm-wiki"
+
+
+@pytest.mark.parametrize(
+    "skill",
+    [
+        "viking://system/compile/example-skills",
+        "viking://system/compile/example-skills/llm-wiki/references",
+        "viking://system/memory/memory_templates/builtin",
+    ],
+)
+def test_compile_rejects_other_system_directories(skill):
+    from openviking.service.compile_service import CompileRequest, CompileService
+    from openviking_cli.utils.config.open_viking_config import CompileApiConfig
+
+    service = CompileService(CompileApiConfig(), ExternalTaskService(), SimpleNamespace())
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    request = CompileRequest.model_validate(
+        {
+            "from": ["viking://resources/source"],
+            "to": "viking://resources/wiki",
+            "skill": skill,
+        }
+    )
+
+    with pytest.raises(InvalidArgumentError, match="skill must resolve"):
+        service._normalize_request_uris(request, ctx)
+
+
+def test_compile_builtin_skill_namespace_is_source_only():
+    from openviking.service.compile_service import CompileService
+
+    CompileService._validate_target("viking://user/alice/skills")
+    CompileService._validate_target("viking://agent/skills")
+
+    with pytest.raises(InvalidArgumentError, match="supported skills namespace"):
+        CompileService._validate_target("viking://system/compile/example-skills")
+
+
 @pytest.mark.asyncio
 async def test_page_reads_past_200_and_isolates_owner():
     agfs = _FakeAgfs()

@@ -25,6 +25,7 @@ from openviking.core.namespace import (
     is_session_uri,
     owner_space_for_uri,
 )
+from openviking.core.namespace_policy import namespace_policy_for_uri
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.service.task_domain import TaskPatch
@@ -210,6 +211,8 @@ class ReindexExecutor:
         A replay reuses accepted work. A pending record without queued work
         resumes enqueueing under the same identity.
         """
+        if not namespace_policy_for_uri(uri).supports_reindex:
+            raise InvalidArgumentError(f"reindex is not supported for namespace: {uri}")
         if task_id is not None and wait:
             raise InvalidArgumentError("task_id requires asynchronous reindex")
         object_type = self._infer_target_type(uri)

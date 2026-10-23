@@ -160,6 +160,7 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
 )
 _ADD_RESOURCE_TRANSIENT_ARGS = frozenset({"tos_signature", "tos_access"})
 _ADD_RESOURCE_TAG_MODES = frozenset({"replace", "append", "clear"})
+_DISPLAY_RESOURCE_CONFIG_FIELDS = frozenset({"resource_name", "resource_tag"})
 
 _INTERNAL_INGESTION_FIELDS = frozenset(
     {
@@ -206,6 +207,17 @@ class _SourcePlan:
     understanding_response_id: Optional[str] = None
     understanding_file_id: Optional[str] = None
     defer_unnamed_target: bool = False
+
+
+def _normalized_resource_config(value: Any) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: Dict[str, str] = {}
+    for key in _DISPLAY_RESOURCE_CONFIG_FIELDS:
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            result[key] = item.strip()
+    return result
 
 
 class ResourceService:
@@ -1794,7 +1806,10 @@ class ResourceService:
             )
         processing_mode = normalize_processing_mode(processing_mode)
         self._validate_add_resource_tag_policy(tags=tags, tag_mode=tag_mode)
-        from openviking.connector.delegate import ConnectorDelegate
+        from openviking.connector.delegate import (
+            CONNECTOR_DISPLAY_RESOURCE_CONFIG_ARG,
+            ConnectorDelegate,
+        )
 
         allowed_reserved_fields = ConnectorDelegate.supported_args(path, add_type).intersection(
             _ADD_RESOURCE_ARGS_RESERVED_FIELDS
@@ -1901,12 +1916,14 @@ class ResourceService:
             watch_auth_state = None
             create_watch = bool(watch_manager and manage_watch and watch_interval > 0)
             if create_watch:
+                connector_watch_auth_args = dict(normalized_args.processor_kwargs)
+                connector_watch_auth_args.pop(CONNECTOR_DISPLAY_RESOURCE_CONFIG_ARG, None)
                 watch_auth_state = await connector.create_watch_auth_state(
                     api_key=ctx.api_key or "",
                     account_id=ctx.account_id,
                     add_type=resolved[0],
                     path=path,
-                    connector_args=normalized_args.processor_kwargs,
+                    connector_args=connector_watch_auth_args,
                 )
             connector_watch_processor_kwargs = self._watch_processor_kwargs(
                 {
@@ -1917,6 +1934,13 @@ class ResourceService:
                 tags,
                 tag_mode,
             )
+            resource_config = _normalized_resource_config(
+                normalized_args.processor_kwargs.get(CONNECTOR_DISPLAY_RESOURCE_CONFIG_ARG)
+            )
+            if resource_config:
+                connector_watch_processor_kwargs[CONNECTOR_DISPLAY_RESOURCE_CONFIG_ARG] = (
+                    resource_config
+                )
             on_success: Optional[Callable[[Optional[Dict[str, Any]]], Awaitable[None]]] = None
             on_complete: Optional[
                 Callable[[str, Optional[str], Optional[str]], Awaitable[None]]
@@ -2030,6 +2054,8 @@ class ResourceService:
             # target alone: many imports share one folder, so the native
             # "watch_interval=0 cancels the watch" rule would pause it as a side
             # effect. Connector watches are paused or deleted only via the watches API.
+            if create_watch:
+                result["watch_id"] = watch_task_id
             return result
 
         from openviking.parse.accessors.feishu_accessor import FeishuAccessor

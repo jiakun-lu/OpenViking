@@ -144,14 +144,14 @@ ov overview viking://resources/docs/
 | uri | str | 是 | - | Viking URI（如 `viking://resources/docs/api.md`）或 32 字符十六进制向量记录 `id`（由 `stat()` 返回） |
 | offset | int | 否 | 0 | 起始行号（0 开始） |
 | limit | int | 否 | -1 | 读取的行数，`-1` 表示读到结尾 |
-| raw | bool | 否 | false | 返回未过滤 MEMORY_FIELDS 的原始存储内容；Python 中使用 `client.read_raw(uri)` 读取此格式。 |
+| raw | bool | 否 | false | 跳过默认脱敏和 MEMORY_FIELDS 过滤，并尝试还原占位符；Python 中使用 `client.read_raw(uri)`。 |
 
 **说明**
 
 - `read()` 只接受文件 URI。传入已存在的目录时返回 `INVALID_ARGUMENT`（HTTP `400`）。HTTP 响应的 `details` 包含 `expected: "file"`、`actual: "directory"` 和目标 `resource` URI，客户端可据此改用目录列表接口，无需解析错误消息。
 - 除 Viking URI 外，还可以传入 `stat()` 返回的 32 字符十六进制文件 `id`。服务端通过向量索引查找对应 URI 并执行相同的权限校验。由于索引是异步生成的，新返回的 ID 可能暂时无法解析；对应向量记录被删除后，按 ID 查询也会失败。这两种情况下，服务端都会返回 `NOT_FOUND`，并提示数据可能尚未索引或已经删除。
 - 公开 URI 参数接受 `resources`、`user` 和 `agent` 作用域。访问 session 文件时，使用 `viking://user/{user_id}/sessions/{session_id}/messages.jsonl`，也可以使用向后兼容的 `viking://session/{session_id}/messages.jsonl` 别名。`temp`、`queue` 等内部作用域会返回 `INVALID_URI`。
-
+- 敏感信息的处理：默认读取（`raw=false`）保留已有占位符，并对残留的已登记明文脱敏；`raw=true` 跳过默认脱敏，返回加载还原后的内容，该还原只影响返回内容，不修改存储文件，详见[隐私配置](../concepts/13-privacy.md)。
 
 **Python SDK**
 

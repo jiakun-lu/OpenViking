@@ -92,17 +92,6 @@ export function ContextExplorerHeader({
         >
           <SearchIcon className="size-4" />
         </Button>
-        {onAddResource ? (
-          <Button
-            type="button"
-            size="icon-sm"
-            variant="ghost"
-            title={t('explorer.addResource')}
-            onClick={onAddResource}
-          >
-            <PlusIcon className="size-4" />
-          </Button>
-        ) : null}
         <Button
           type="button"
           size="icon-sm"
@@ -115,6 +104,18 @@ export function ContextExplorerHeader({
           />
         </Button>
       </div>
+      {onAddResource ? (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="mt-3 w-full justify-center gap-2"
+          onClick={onAddResource}
+        >
+          <PlusIcon className="size-4" />
+          {t('explorer.addResource')}
+        </Button>
+      ) : null}
     </div>
   )
 }

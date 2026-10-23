@@ -142,7 +142,7 @@ claude mcp add --transport http openviking \
 | `forget` | 删除任意 `viking://` URI（先用 `search` 查找；删除目录需 `recursive=true`）。用它删 skill 目录会残留该 skill 的 privacy 配置，请改用 `ov skills remove` 或 `DELETE /api/v1/skills/{name}` | `uri`, `recursive`（可选） |
 | `health` | 检查 OpenViking 服务健康状态 | 无 |
 | `privacy_tree` | 盘点已保存的凭据；返回当前字段元数据及引用，不含值 | `category`（可选） |
-| `privacy_resolve` | 将完整的 `{{ov_privacy:...}}` 占位符解析为一个当前字段的实际值，供立即使用 | `reference` |
+| `privacy_resolve` | 将完整的 <code v-pre>{{ov_privacy:...}}</code> 占位符解析为一个当前字段的实际值，供立即使用 | `reference` |
 | `privacy_upsert` | 原子合并用户提供的凭据字段；返回元数据和引用，不回显值 | `category`, `target_key`, `values` |
 | `list_users` | 查询当前 account 的用户 ID；默认不返回凭证，管理员也一样 | `query`(可选，ID 子串), `limit`(默认 100), `page`(默认 1), `include_credentials`(默认 false，仅 ADMIN/ROOT 可设为 true) |
 | `list_groups` | 查询当前 account 的组 ID，不返回成员名单 | 无 |

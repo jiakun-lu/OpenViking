@@ -858,8 +858,10 @@ class CompileService:
         classification = classify_uri(target)
         parts = uri_parts(target)
         if classification.context_type == "skill":
-            if not classification.is_skill_namespace or (
-                classification.scope == "agent" and parts != ["agent", "skills"]
+            if (
+                not classification.is_skill_namespace
+                or classification.scope not in {"user", "agent"}
+                or (classification.scope == "agent" and parts != ["agent", "skills"])
             ):
                 raise InvalidArgumentError(
                     "Compile Skill target must be a supported skills namespace"
